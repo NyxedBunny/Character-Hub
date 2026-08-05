@@ -1,0 +1,2566 @@
+import * as CoreAPI from './core-api.js';
+
+let isInitialized = false;
+let currentUpdateChecks = new Map(); // fullPath -> { local, remote, diffs }
+let abortController = null;
+let pendingBatchCharacters = [];
+let batchCheckPaused = false;
+let batchCheckRunning = false;
+let batchCheckedCount = 0;
+let batchSelectedAvatars = new Set(); // Characters checked for inclusion in Apply All
+let batchStatusFilter = 'all'; // Active filter: 'all' | 'has-updates' | 'up-to-date' | 'errors' | 'unavailable' | 'applied'
+
+// Base fields to compare (key -> display label) - provider fields merged at init
+const BASE_COMPARABLE_FIELDS = {
+    // Core character fields
+    'name': 'Name',
+    'description': 'Description',
+    'personality': 'Personality',
+    'scenario': 'Scenario',
+    'first_mes': 'First Message',
+    'mes_example': 'Example Messages',
+    'system_prompt': 'System Prompt',
+    'post_history_instructions': 'Post History Instructions',
+    'creator_notes': 'Creator Notes',
+    'creator': 'Creator',
+    'tags': 'Tags',
+    'alternate_greetings': 'Alternate Greetings',
+    // V3 additions
+    'nickname': 'Nickname',
+    'group_only_greetings': 'Group Only Greetings',
+    // Depth prompt (ST stores in extensions.depth_prompt, providers may return at data.depth_prompt)
+    'depth_prompt.prompt': "Character's Note",
+    'depth_prompt.depth': "Character's Note Depth",
+    'depth_prompt.role': "Character's Note Role",
+    'character_book': 'Embedded Lorebook',
+    // Virtual field: listing name lives in extensions.{provider}.pageName locally,
+    // and in remoteCard._listingName on the remote side.
+    'listing_name': 'Listing Name',
+};
+
+const BASE_FIELD_ICONS = {
+    'name': 'fa-solid fa-signature',
+    'description': 'fa-solid fa-scroll',
+    'personality': 'fa-solid fa-brain',
+    'scenario': 'fa-solid fa-map',
+    'first_mes': 'fa-solid fa-comment',
+    'mes_example': 'fa-solid fa-comments',
+    'system_prompt': 'fa-solid fa-terminal',
+    'post_history_instructions': 'fa-solid fa-clock-rotate-left',
+    'creator_notes': 'fa-solid fa-sticky-note',
+    'creator': 'fa-solid fa-pen-nib',
+    'tags': 'fa-solid fa-tags',
+    'alternate_greetings': 'fa-solid fa-list',
+    'nickname': 'fa-solid fa-id-badge',
+    'group_only_greetings': 'fa-solid fa-users',
+    'depth_prompt.prompt': 'fa-solid fa-layer-group',
+    'depth_prompt.depth': 'fa-solid fa-arrow-down-1-9',
+    'depth_prompt.role': 'fa-solid fa-user-tag',
+    'character_book': 'fa-solid fa-book',
+    'listing_name': 'fa-solid fa-store',
+};
+
+// Effective fields - rebuilt after providers register
+let COMPARABLE_FIELDS = { ...BASE_COMPARABLE_FIELDS };
+let FIELD_ICONS = { ...BASE_FIELD_ICONS };
+
+// Maps provider-specific field paths to their provider ID
+// Base fields are NOT in this map - only provider-contributed fields.
+let fieldProviderMap = {};
+
+// Groups of provider fields that share a single filter checkbox.
+// Maps group name → { label, icon, paths: string[] }
+let fieldGroups = {};
+
+// Fields relevant to the current batch (based on represented providers)
+// Null = all fields (single-check mode). Set = filtered for batch.
+let batchRelevantFields = null;
+
+function fieldIcon(field) {
+    const icon = FIELD_ICONS[field] || 'fa-solid fa-file-alt';
+    const label = COMPARABLE_FIELDS[field] || field;
+    return `<i class="${icon} batch-field-icon" title="${label}"></i>`;
+}
+
+let batchFieldSelection = new Set(
+    Object.keys(COMPARABLE_FIELDS)
+);
+
+// Fields that should use text diff view
+const BASE_LONG_TEXT_FIELDS = new Set([
+    'description', 'personality', 'scenario', 'first_mes', 
+    'mes_example', 'system_prompt', 'post_history_instructions',
+    'creator_notes', 'depth_prompt.prompt', 'alternate_greetings',
+    'group_only_greetings'
+]);
+let LONG_TEXT_FIELDS = new Set(BASE_LONG_TEXT_FIELDS);
+
+function rebuildEffectiveFields() {
+    COMPARABLE_FIELDS = { ...BASE_COMPARABLE_FIELDS };
+    FIELD_ICONS = { ...BASE_FIELD_ICONS };
+    LONG_TEXT_FIELDS = new Set(BASE_LONG_TEXT_FIELDS);
+    fieldProviderMap = {};
+    fieldGroups = {};
+
+    const providers = CoreAPI.getAllProviders();
+    for (const p of providers) {
+        const fields = p.getComparableFields?.() || [];
+        for (const f of fields) {
+            COMPARABLE_FIELDS[f.path] = f.label;
+            if (f.icon) FIELD_ICONS[f.path] = f.icon;
+            fieldProviderMap[f.path] = p.id;
+
+            if (f.group) {
+                if (!fieldGroups[f.group]) {
+                    fieldGroups[f.group] = {
+                        label: f.groupLabel || f.group,
+                        icon: f.icon || 'fa-solid fa-file-alt',
+                        paths: []
+                    };
+                }
+                fieldGroups[f.group].paths.push(f.path);
+            }
+        }
+    }
+    batchFieldSelection = new Set(Object.keys(COMPARABLE_FIELDS));
+}
+
+export function init(deps) {
+    if (isInitialized) {
+        console.warn('[CardUpdates] Already initialized');
+        return;
+    }
+    
+    injectModals();
+    setupEventListeners();
+    rebuildEffectiveFields();
+
+    window.registerOverlay?.({ id: 'cardUpdateSingleModal', tier: 7, close: () => closeSingleModal(), visible: (el) => el.classList.contains('visible') });
+    window.registerOverlay?.({ id: 'cardUpdateBatchModal', tier: 8, close: () => closeBatchModal(), visible: (el) => el.classList.contains('visible') });
+    
+    isInitialized = true;
+    CoreAPI.debugLog('[CardUpdates] Module initialized');
+}
+
+export async function checkSingleCharacter(char) {
+    if (!isInitialized) {
+        console.error('[CardUpdates] Module not initialized');
+        return;
+    }
+    
+    const linkInfo = getProviderLinkInfo(char);
+    if (!linkInfo?.fullPath) {
+        CoreAPI.showToast('Character is not linked to an online provider', 'warning');
+        return;
+    }
+    
+    showSingleCheckModal(char);
+
+    if (CoreAPI.isUpdateLocked(char)) {
+        const statusEl = document.getElementById('cardUpdateSingleStatus');
+        if (statusEl) {
+            statusEl.innerHTML = `<i class="fa-solid fa-lock"></i> Updates are locked for this character
+                <button id="cardUpdateSingleUnlockBtn" class="card-update-unlock-check-btn">
+                    <i class="fa-solid fa-lock-open"></i> Unlock & Check
+                </button>`;
+            document.getElementById('cardUpdateSingleUnlockBtn')?.addEventListener('click', async () => {
+                try {
+                    await CoreAPI.setUpdateLocked(char.avatar, false);
+                    statusEl.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Checking for updates...';
+                    await performSingleCheck(char);
+                } catch (err) {
+                    console.error('[CardUpdates] Failed to unlock:', err);
+                    statusEl.innerHTML = '<i class="fa-solid fa-exclamation-triangle"></i> Failed to unlock character';
+                }
+            });
+        }
+        return;
+    }
+
+    await performSingleCheck(char);
+}
+
+export async function checkAllLinkedCharacters() {
+    if (!isInitialized) {
+        console.error('[CardUpdates] Module not initialized');
+        return;
+    }
+    
+    const linkedChars = getLinkedCharacters();
+    if (linkedChars.length === 0) {
+        CoreAPI.showToast('No characters are linked to an online provider', 'info');
+        return;
+    }
+    
+    showBatchCheckModal(linkedChars);
+}
+
+export async function checkSelectedCharacters() {
+    if (!isInitialized) {
+        console.error('[CardUpdates] Module not initialized');
+        return;
+    }
+    
+    const selected = CoreAPI.getSelectedCharacters();
+    if (!selected || selected.length === 0) {
+        CoreAPI.showToast('No characters selected', 'warning');
+        return;
+    }
+    
+    // Filter to only provider-linked characters
+    const linkedSelected = selected.filter(c => getProviderLinkInfo(c)?.fullPath);
+    if (linkedSelected.length === 0) {
+        CoreAPI.showToast('None of the selected characters are linked to an online provider', 'warning');
+        return;
+    }
+    
+    showBatchCheckModal(linkedSelected);
+}
+
+// ========================================
+// PROVIDER INTEGRATION
+// ========================================
+
+/**
+ * @param {Object} char - Character object
+ * @returns {Object|null} { providerId, id, fullPath, linkedAt } or null
+ */
+function getProviderLinkInfo(char) {
+    return CoreAPI.getProviderLinkInfo(char);
+}
+
+/**
+ * @returns {Array} Characters with provider links
+ */
+function getLinkedCharacters() {
+    const all = CoreAPI.getAllLinkedCharacters();
+    return all.map(item => item.char);
+}
+
+function getNestedValue(obj, path) {
+    return path.split('.').reduce((o, k) => o?.[k], obj);
+}
+
+function getFieldValue(data, field) {
+    if (field.startsWith('depth_prompt.')) {
+        const sub = field.slice('depth_prompt.'.length);
+        const top = data?.depth_prompt?.[sub];
+        if (top !== undefined) return top;
+        return data?.extensions?.depth_prompt?.[sub];
+    }
+    return getNestedValue(data, field);
+}
+
+function generateLineDiff(localValue, remoteValue) {
+    const localStr = formatValueForDisplay(localValue);
+    const remoteStr = formatValueForDisplay(remoteValue);
+    
+    const localLines = localStr.split('\n');
+    const remoteLines = remoteStr.split('\n');
+    
+    const diff = computeLineDiff(localLines, remoteLines);
+    
+    // Post-process to detect modified lines (removed+added pairs) and highlight word changes
+    const processedDiff = [];
+    for (let i = 0; i < diff.length; i++) {
+        const item = diff[i];
+        
+        if (item.type === 'removed' && i + 1 < diff.length && diff[i + 1].type === 'added') {
+            const oldLine = item.line;
+            const newLine = diff[i + 1].line;
+            
+            const { oldHtml, newHtml } = computeWordDiff(oldLine, newLine);
+            processedDiff.push({ type: 'removed', html: oldHtml });
+            processedDiff.push({ type: 'added', html: newHtml });
+            i++; // Skip the next item since we processed it
+        } else {
+            processedDiff.push({ type: item.type, html: CoreAPI.escapeHtml(item.line) });
+        }
+    }
+    
+    let html = '';
+    
+    for (const item of processedDiff) {
+        if (item.type === 'removed') {
+            html += `<div class="card-update-diff-line removed"><span class="card-update-diff-line-prefix">-</span>${item.html}</div>`;
+        } else if (item.type === 'added') {
+            html += `<div class="card-update-diff-line added"><span class="card-update-diff-line-prefix">+</span>${item.html}</div>`;
+        } else {
+            html += `<div class="card-update-diff-line context"><span class="card-update-diff-line-prefix"> </span>${item.html}</div>`;
+        }
+    }
+    
+    return html || '<div class="card-update-diff-line context">(no content)</div>';
+}
+
+function generateSideBySideDiff(localValue, remoteValue) {
+    const localStr = formatValueForDisplay(localValue);
+    const remoteStr = formatValueForDisplay(remoteValue);
+    
+    const localLines = localStr.split('\n');
+    const remoteLines = remoteStr.split('\n');
+    
+    const lineDiff = computeLineDiff(localLines, remoteLines);
+    
+    const localOutput = [];
+    const remoteOutput = [];
+    let changedLines = 0;
+    let addedLines = 0;
+    let removedLines = 0;
+    
+    let i = 0;
+    while (i < lineDiff.length) {
+        const item = lineDiff[i];
+        
+        if (item.type === 'context') {
+            localOutput.push({ type: 'context', html: CoreAPI.escapeHtml(item.line) });
+            remoteOutput.push({ type: 'context', html: CoreAPI.escapeHtml(item.line) });
+            i++;
+        } else if (item.type === 'removed' && i + 1 < lineDiff.length && lineDiff[i + 1].type === 'added') {
+            const { oldHtml, newHtml } = computeWordDiff(item.line, lineDiff[i + 1].line);
+            localOutput.push({ type: 'changed', html: oldHtml });
+            remoteOutput.push({ type: 'changed', html: newHtml });
+            changedLines++;
+            i += 2;
+        } else if (item.type === 'removed') {
+            localOutput.push({ type: 'removed', html: CoreAPI.escapeHtml(item.line) });
+            remoteOutput.push({ type: 'empty', html: '' });
+            removedLines++;
+            i++;
+        } else if (item.type === 'added') {
+            localOutput.push({ type: 'empty', html: '' });
+            remoteOutput.push({ type: 'added', html: CoreAPI.escapeHtml(item.line) });
+            addedLines++;
+            i++;
+        } else {
+            i++;
+        }
+    }
+    
+    const localHtml = localOutput.map(item => {
+        if (item.type === 'empty') {
+            return '<div class="diff-line empty"></div>';
+        }
+        const className = item.type === 'context' ? 'diff-line' : 
+                         item.type === 'changed' ? 'diff-line changed' : 
+                         'diff-line removed';
+        return `<div class="${className}">${item.html || '&nbsp;'}</div>`;
+    }).join('');
+    
+    const remoteHtml = remoteOutput.map(item => {
+        if (item.type === 'empty') {
+            return '<div class="diff-line empty"></div>';
+        }
+        const className = item.type === 'context' ? 'diff-line' : 
+                         item.type === 'changed' ? 'diff-line changed' : 
+                         'diff-line added';
+        return `<div class="${className}">${item.html || '&nbsp;'}</div>`;
+    }).join('');
+    
+    const statParts = [];
+    if (changedLines > 0) statParts.push(`${changedLines} modified`);
+    if (addedLines > 0) statParts.push(`${addedLines} added`);
+    if (removedLines > 0) statParts.push(`${removedLines} removed`);
+    const stats = statParts.length > 0 ? statParts.join(', ') : 'different';
+    
+    return { localHtml, remoteHtml, stats };
+}
+
+function computeWordDiff(oldLine, newLine) {
+    // Tokenize into words (keeping whitespace attached)
+    const oldWords = tokenizeForDiff(oldLine);
+    const newWords = tokenizeForDiff(newLine);
+    
+    // LCS on words
+    const m = oldWords.length;
+    const n = newWords.length;
+    const dp = Array(m + 1).fill(null).map(() => Array(n + 1).fill(0));
+    
+    for (let i = 1; i <= m; i++) {
+        for (let j = 1; j <= n; j++) {
+            if (oldWords[i - 1] === newWords[j - 1]) {
+                dp[i][j] = dp[i - 1][j - 1] + 1;
+            } else {
+                dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+            }
+        }
+    }
+    
+    // Backtrack to build diff
+    const oldResult = [];
+    const newResult = [];
+    let i = m, j = n;
+    
+    while (i > 0 || j > 0) {
+        if (i > 0 && j > 0 && oldWords[i - 1] === newWords[j - 1]) {
+            oldResult.unshift({ type: 'same', text: oldWords[i - 1] });
+            newResult.unshift({ type: 'same', text: newWords[j - 1] });
+            i--;
+            j--;
+        } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+            newResult.unshift({ type: 'added', text: newWords[j - 1] });
+            j--;
+        } else {
+            oldResult.unshift({ type: 'removed', text: oldWords[i - 1] });
+            i--;
+        }
+    }
+    
+    // Convert to HTML
+    const oldHtml = oldResult.map(item => {
+        const escaped = CoreAPI.escapeHtml(item.text);
+        return item.type === 'removed' 
+            ? `<span class="word-removed">${escaped}</span>` 
+            : escaped;
+    }).join('');
+    
+    const newHtml = newResult.map(item => {
+        const escaped = CoreAPI.escapeHtml(item.text);
+        return item.type === 'added' 
+            ? `<span class="word-added">${escaped}</span>` 
+            : escaped;
+    }).join('');
+    
+    return { oldHtml, newHtml };
+}
+
+function tokenizeForDiff(str) {
+    // Split on word boundaries, keeping the delimiters
+    return str.match(/\S+|\s+/g) || [];
+}
+
+function computeLineDiff(oldLines, newLines) {
+    const m = oldLines.length;
+    const n = newLines.length;
+    
+    // Build LCS table
+    const dp = Array(m + 1).fill(null).map(() => Array(n + 1).fill(0));
+    
+    for (let i = 1; i <= m; i++) {
+        for (let j = 1; j <= n; j++) {
+            if (oldLines[i - 1] === newLines[j - 1]) {
+                dp[i][j] = dp[i - 1][j - 1] + 1;
+            } else {
+                dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);
+            }
+        }
+    }
+    
+    // Backtrack to find diff
+    const result = [];
+    let i = m, j = n;
+    
+    while (i > 0 || j > 0) {
+        if (i > 0 && j > 0 && oldLines[i - 1] === newLines[j - 1]) {
+            result.unshift({ type: 'context', line: oldLines[i - 1] });
+            i--;
+            j--;
+        } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+            result.unshift({ type: 'added', line: newLines[j - 1] });
+            j--;
+        } else {
+            result.unshift({ type: 'removed', line: oldLines[i - 1] });
+            i--;
+        }
+    }
+    
+    return result;
+}
+
+function compareCards(localData, remoteCard, allowedFields = null) {
+    const diffs = [];
+    const remoteData = remoteCard?.data || remoteCard;
+    
+    for (const [field, label] of Object.entries(COMPARABLE_FIELDS)) {
+        if (allowedFields && !allowedFields.has(field)) {
+            continue;
+        }
+
+        // listing_name is a virtual field: local lives in extensions.{provider}.pageName,
+        // remote lives on the outer remoteCard._listingName (not inside .data)
+        if (field === 'listing_name') {
+            const remoteListingName = remoteCard?._listingName || '';
+            if (!remoteListingName) continue;
+            const localListingName = CoreAPI.getListingNameFromExtensions({ data: localData }) || '';
+            if (normalizeValue(localListingName) !== normalizeValue(remoteListingName)) {
+                diffs.push({ field, label, local: localListingName, remote: remoteListingName, isLongText: false });
+            }
+            continue;
+        }
+
+        const localValue = getFieldValue(localData, field);
+        const remoteValue = getFieldValue(remoteData, field);
+
+        if (field === 'character_book') {
+            // Remote source knows a lorebook exists but couldnt include its content: unknown, not removed.
+            if (remoteCard?._lorebookUnavailable) continue;
+            const remoteEntries = remoteValue?.entries || [];
+            const localEntries = localValue?.entries || [];
+
+            // Remote has no lorebook but local does - lorebook was removed upstream
+            if (remoteEntries.length === 0 && !hasRemoteLorebookMeta(remoteValue)) {
+                if (localEntries.length > 0) {
+                    diffs.push({ field, label, local: localValue, remote: remoteValue, isLongText: false });
+                }
+                continue;
+            }
+
+            // Quick equality check
+            if (lorebooksEqual(localValue, remoteValue)) continue;
+
+            // Deeper semantic check
+            const { matched, added, removed } = matchLorebookEntries(localEntries, remoteEntries);
+            const modified = matched.filter(m => m.changedFields.length > 0);
+            const metaDiffs = compareLorebookMeta(localValue, remoteValue);
+
+            if (added.length === 0 && modified.length === 0 && metaDiffs.length === 0 && removed.length === 0) continue;
+
+            diffs.push({
+                field, label,
+                local: localValue,
+                remote: remoteValue,
+                isLongText: false,
+            });
+            continue;
+        }
+        
+        const normalizedLocal = normalizeValue(localValue, field);
+        const normalizedRemote = normalizeValue(remoteValue, field);
+        
+        if (!valuesEqual(normalizedLocal, normalizedRemote)) {
+            diffs.push({
+                field,
+                label,
+                local: localValue,
+                remote: remoteValue,
+                isLongText: LONG_TEXT_FIELDS.has(field)
+            });
+        }
+    }
+    
+    return diffs;
+}
+
+const ORDER_INSENSITIVE_FIELDS = new Set(['tags']);
+
+function normalizeValue(value, field = '') {
+    if (value === null || value === undefined) return '';
+    if (Array.isArray(value)) {
+        if (value.length === 0) return '';
+        const caseInsensitive = ORDER_INSENSITIVE_FIELDS.has(field);
+        const normalized = [...value].map(v =>
+            typeof v === 'string'
+                ? (caseInsensitive ? v.replace(/\r\n/g, '\n').trim().toLowerCase() : v.replace(/\r\n/g, '\n').trim())
+                : JSON.stringify(v)
+        );
+        if (caseInsensitive) {
+            normalized.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+        }
+        return JSON.stringify(normalized);
+    }
+    if (typeof value === 'object') return JSON.stringify(value);
+    return String(value).replace(/\r\n/g, '\n').trim();
+}
+
+function valuesEqual(a, b) {
+    return a === b;
+}
+
+// ========================================
+// SINGLE CHARACTER CHECK
+// ========================================
+
+// The avatar of the character currently shown in the single-check modal.
+// Stored here instead of in HTML attributes to avoid special-character escaping issues.
+let singleModalAvatar = null;
+let singleModalClosedAt = 0;
+
+function openCharModalAbove(char) {
+    CoreAPI.openCharModalElevated(char);
+}
+
+/**
+ * Show single character update check modal
+ * @param {Object} char - Character to check
+ */
+function showSingleCheckModal(char) {
+    const modal = document.getElementById('cardUpdateSingleModal');
+    const charName = CoreAPI.getCharacterName(char) || 'Unknown';
+    singleModalAvatar = char.avatar;
+    
+    const nameEl = document.getElementById('cardUpdateSingleCharName');
+    nameEl.textContent = charName;
+    nameEl.classList.add('card-update-char-link');
+    nameEl.onclick = () => openCharModalAbove(char);
+    
+    document.getElementById('cardUpdateSingleStatus').innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Checking for updates...';
+    document.getElementById('cardUpdateSingleContent').innerHTML = '';
+    document.getElementById('cardUpdateSingleApplyBtn').disabled = true;
+    updateSourceBadge(modal, char);
+    
+    modal.classList.add('visible');
+}
+
+/**
+ * Perform update check for a single character
+ * @param {Object} char - Character to check
+ */
+async function performSingleCheck(char) {
+    const statusEl = document.getElementById('cardUpdateSingleStatus');
+    const contentEl = document.getElementById('cardUpdateSingleContent');
+    const applyBtn = document.getElementById('cardUpdateSingleApplyBtn');
+    
+    const match = CoreAPI.getCharacterProvider(char);
+    if (!match) {
+        statusEl.innerHTML = '<i class="fa-solid fa-exclamation-triangle"></i> Character has no provider link';
+        return;
+    }
+    const { provider, linkInfo } = match;
+    
+    try {
+        // Ensure heavy fields are loaded before comparing card content
+        await CoreAPI.hydrateCharacter(char);
+        
+        await provider.refreshRemoteData(linkInfo, {
+            onStatus: (msg) => {
+                statusEl.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> ${CoreAPI.escapeHtml(msg)}`;
+            },
+        });
+        
+        statusEl.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Fetching remote card...';
+        const remoteCard = await provider.fetchRemoteCard(linkInfo);
+        
+        if (!remoteCard) {
+            statusEl.innerHTML = '<i class="fa-solid fa-exclamation-triangle"></i> Could not fetch remote card data';
+            return;
+        }
+
+        const localData = char.data || char;
+
+        const diffs = compareCards(localData, remoteCard);
+        
+        if (diffs.length === 0) {
+            statusEl.innerHTML = '<i class="fa-solid fa-check"></i> Character is up to date!';
+            return;
+        }
+        
+        statusEl.innerHTML = `<i class="fa-solid fa-arrow-right-arrow-left"></i> Found ${diffs.length} difference${diffs.length > 1 ? 's' : ''}`;
+        
+        currentUpdateChecks.set(char.avatar, { char, localData, remoteCard, diffs });
+        
+        // Render diff UI
+        contentEl.innerHTML = renderDiffList(diffs);
+        resolveWorldFileStatus(contentEl, char.avatar).catch(e => console.error('[CardUpdates] World status check failed:', e));
+        applyBtn.disabled = false;
+        
+    } catch (error) {
+        console.error('[CardUpdates] Check failed:', error);
+        statusEl.innerHTML = '<i class="fa-solid fa-xmark"></i> Error checking for updates';
+    }
+}
+
+/**
+ * Render the diff list HTML
+ * @param {Array} diffs - Array of diff objects
+ * @returns {string} HTML string
+ */
+function renderDiffList(diffs) {
+    return `
+        <div class="card-update-diff-list">
+            <label class="card-update-select-all">
+                <input type="checkbox" checked class="card-update-select-all-cb">
+                <span>Select All</span>
+            </label>
+            ${diffs.map((diff, idx) => renderDiffItem(diff, idx)).join('')}
+        </div>
+    `;
+}
+
+/**
+ * Render a single diff item
+ * @param {Object} diff - Diff object
+ * @param {number} idx - Index for unique ID
+ * @returns {string} HTML string
+ */
+function renderDiffItem(diff, idx) {
+    const checkboxId = `diff-item-${idx}`;
+    const localDisplay = formatValueForDisplay(diff.local);
+    const remoteDisplay = formatValueForDisplay(diff.remote);
+
+    if (diff.field === 'character_book') {
+        return renderLorebookDiff(diff, idx);
+    }
+
+    if (!diff.isLongText && (Array.isArray(diff.local) || Array.isArray(diff.remote))) {
+        const localValues = Array.isArray(diff.local) ? diff.local : [];
+        const remoteValues = Array.isArray(diff.remote) ? diff.remote : [];
+        return `
+            <div class="card-update-diff-item short array">
+                <label>
+                    <input type="checkbox" id="${checkboxId}" data-field="${diff.field}" checked>
+                    <span class="card-update-diff-label">${CoreAPI.escapeHtml(diff.label)}</span>
+                </label>
+                <div class="card-update-array-diff">
+                    <div class="card-update-array-column local">
+                        <div class="card-update-array-header">
+                            <span>Local</span>
+                            <span class="card-update-array-count">${localValues.length}</span>
+                        </div>
+                        ${renderArrayList(localValues, diff.field, remoteValues)}
+                    </div>
+                    <div class="card-update-array-column remote">
+                        <div class="card-update-array-header">
+                            <span>Remote</span>
+                            <span class="card-update-array-count">${remoteValues.length}</span>
+                        </div>
+                        ${renderArrayList(remoteValues, diff.field, localValues)}
+                    </div>
+                </div>
+            </div>
+        `;
+    }
+    
+    if (diff.isLongText) {
+        const { localHtml, remoteHtml, stats } = generateSideBySideDiff(diff.local, diff.remote);
+        return `
+            <div class="card-update-diff-item long-text">
+                <div class="card-update-diff-header">
+                    <label>
+                        <input type="checkbox" id="${checkboxId}" data-field="${diff.field}" checked>
+                        <span class="card-update-diff-label">${CoreAPI.escapeHtml(diff.label)}</span>
+                    </label>
+                    <span class="card-update-diff-stats">${stats}</span>
+                    <button class="card-update-diff-expand">
+                        <i class="fa-solid fa-chevron-down"></i>
+                    </button>
+                </div>
+                <div class="card-update-diff-content collapsed">
+                    <div class="card-update-diff-sidebyside">
+                        <div class="card-update-diff-panel local">
+                            <div class="card-update-diff-panel-header">
+                                <i class="fa-solid fa-house"></i> Your Version
+                            </div>
+                            <div class="card-update-diff-panel-content">
+                                ${localHtml}
+                            </div>
+                        </div>
+                        <div class="card-update-diff-panel remote">
+                            <div class="card-update-diff-panel-header">
+                                <i class="fa-solid fa-cloud"></i> Remote Version
+                            </div>
+                            <div class="card-update-diff-panel-content">
+                                ${remoteHtml}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+    }
+    
+    return `
+        <div class="card-update-diff-item short">
+            <label>
+                <input type="checkbox" id="${checkboxId}" data-field="${diff.field}" checked>
+                <span class="card-update-diff-label">${CoreAPI.escapeHtml(diff.label)}</span>
+            </label>
+            <div class="card-update-diff-values">
+                <span class="local-value" title="${CoreAPI.escapeHtml(localDisplay)}">${CoreAPI.escapeHtml(CoreAPI.truncate(localDisplay, 50))}</span>
+                <i class="fa-solid fa-arrow-right"></i>
+                <span class="remote-value" title="${CoreAPI.escapeHtml(remoteDisplay)}">${CoreAPI.escapeHtml(CoreAPI.truncate(remoteDisplay, 50))}</span>
+            </div>
+        </div>
+    `;
+}
+
+// ========================================
+// LOREBOOK DIFF
+// ========================================
+
+function renderLorebookDiff(diff, idx) {
+    const checkboxId = `diff-item-${idx}`;
+    const localBook = diff.local;
+    const remoteBook = diff.remote;
+    const localEntries = localBook?.entries || [];
+    const remoteEntries = remoteBook?.entries || [];
+
+    const { matched, added, removed } = matchLorebookEntries(localEntries, remoteEntries);
+    const modified = matched.filter(m => m.changedFields.length > 0);
+    const metaDiffs = compareLorebookMeta(localBook, remoteBook);
+
+    // "removed" = entries in embedded lorebook but not on remote
+    const localOnly = removed;
+
+    if (added.length === 0 && localOnly.length === 0 && modified.length === 0 && metaDiffs.length === 0) return '';
+
+    // Stat pills for the collapsed header
+    const statParts = [];
+    if (added.length > 0) statParts.push(`${added.length} new from remote`);
+    if (localOnly.length > 0) statParts.push(`${localOnly.length} local-only`);
+    if (modified.length > 0) statParts.push(`${modified.length} modified`);
+    if (metaDiffs.length > 0) statParts.push(`${metaDiffs.length} setting${metaDiffs.length > 1 ? 's' : ''} changed`);
+    const stats = statParts.join(', ');
+
+    const remoteRemoved = remoteEntries.length === 0 && !hasRemoteLorebookMeta(remoteBook);
+    let entriesHtml = '';
+
+    if (remoteRemoved) {
+        entriesHtml += `<div class="lorebook-diff-info-box" style="border-color:rgba(255,152,0,0.3); background:rgba(255,152,0,0.06);">
+            <i class="fa-solid fa-triangle-exclamation" style="color:#ffb74d;"></i>
+            <div>
+                <strong>Lorebook removed on remote</strong>
+                <p style="margin:4px 0 0;">The remote card no longer includes an embedded lorebook. Applying this change will clear the ${localEntries.length} embedded entr${localEntries.length === 1 ? 'y' : 'ies'} from your card. Your World Info file (if any) is never modified.</p>
+            </div>
+        </div>`;
+    }
+
+    // Help & tips - collapsible explainer
+    entriesHtml += `<div class="lorebook-diff-info-box">
+        <i class="fa-solid fa-circle-info"></i>
+        <div>
+            <strong>Embedded lorebook ↔ Remote version</strong>
+            <details class="lorebook-diff-help-details">
+                <summary>How lorebook updates work</summary>
+                <div class="lorebook-diff-help-body">
+                    <p>SillyTavern keeps lorebook data in <em>two</em> separate places:</p>
+                    <ul>
+                        <li><strong>Embedded lorebook</strong> (inside the card) — this is the copy that Character Library compares and updates. It was created when you first imported the card and is not changed by SillyTavern's World Info editor.</li>
+                        <li><strong>World Info file</strong> (in <code>/worlds/</code>) — the live working copy that SillyTavern actually uses in chats. All edits you make in the World Info panel go here. The update checker <em>never</em> modifies this file.</li>
+                    </ul>
+                    <p>The diff below compares your card's embedded lorebook against the creator's latest remote version. Applying will replace the embedded lorebook with the remote version.</p>
+                    <p><strong>What the badges mean:</strong></p>
+                    <ul>
+                        <li><span style="color:var(--cl-success-pale);">+</span> <strong>New from remote</strong>: entry exists on the remote provider but not in your card. Will be added.</li>
+                        <li><span style="color:#ffcc80;">~</span> <strong>Modified</strong> — entry exists in both but some fields differ. Will be updated to match the remote.</li>
+                        <li><span style="color:#bdbdbd;">★</span> <strong>Local-only</strong> — entry is in your card but not on the remote. Since applying replaces the full embedded lorebook, this entry will be removed from the card.</li>
+                    </ul>
+                    <p>For local-only entries that would be removed, Character Library reads your World Info file to check whether each entry also exists there:</p>
+                    <ul>
+                        <li><i class="fa-solid fa-shield-halved" style="color:var(--cl-success-pale);"></i> <strong>Safe in World Info</strong>: a matching entry exists in your World Info file. Removing it from the card won't affect your chats since the live copy is untouched.</li>
+                        <li><i class="fa-solid fa-triangle-exclamation" style="color:#ffb74d;"></i> <strong>Not in World Info</strong> — no match found. This entry only exists in the card's embedded data and will be permanently lost after applying.</li>
+                    </ul>
+                </div>
+            </details>
+        </div>
+    </div>`;
+
+    if (metaDiffs.length > 0) {
+        entriesHtml += `<div class="lorebook-diff-meta-section">
+            <div class="lorebook-diff-meta-title">Lorebook Settings</div>
+            ${metaDiffs.map(m => `<div class="lorebook-diff-meta-row">
+                <span class="lorebook-diff-meta-key">${CoreAPI.escapeHtml(m.label)}</span>
+                <span class="lorebook-diff-meta-old">${CoreAPI.escapeHtml(m.localStr)}</span>
+                <i class="fa-solid fa-arrow-right"></i>
+                <span class="lorebook-diff-meta-new">${CoreAPI.escapeHtml(m.remoteStr)}</span>
+            </div>`).join('')}
+        </div>`;
+    }
+
+    // Entries that exist on remote but not locally - will be added
+    for (const entry of added) {
+        const name = lorebookEntryName(entry);
+        const keys = (entry.keys || []).slice(0, 4).join(', ');
+        entriesHtml += `<div class="lorebook-diff-entry added" title="New entry from the remote card — will be added on apply">
+            <span class="lorebook-diff-badge added">+</span>
+            <span class="lorebook-diff-entry-name">${CoreAPI.escapeHtml(name)}</span>
+            ${keys ? `<span class="lorebook-diff-entry-keys">${CoreAPI.escapeHtml(keys)}</span>` : ''}
+            <span class="lorebook-diff-entry-tag added">new from remote</span>
+        </div>`;
+    }
+
+    // Entries in embedded lorebook but not on remote - will be lost from embedded on apply
+    for (const entry of localOnly) {
+        const name = lorebookEntryName(entry);
+        const keys = (entry.keys || []).slice(0, 4).join(', ');
+        const keysData = CoreAPI.escapeHtml(JSON.stringify(entry.keys || []));
+        const nameData = CoreAPI.escapeHtml(entry.comment || entry.name || '');
+        entriesHtml += `<div class="lorebook-diff-entry local-only" data-lb-keys="${keysData}" data-lb-name="${nameData}" title="This entry is in your embedded lorebook but not on the remote card. Applying will replace the embedded lorebook with the remote version, so this entry will be removed from the card.">
+            <span class="lorebook-diff-badge local-only">&#9733;</span>
+            <span class="lorebook-diff-entry-name">${CoreAPI.escapeHtml(name)}</span>
+            ${keys ? `<span class="lorebook-diff-entry-keys">${CoreAPI.escapeHtml(keys)}</span>` : ''}
+            <span class="lorebook-diff-entry-tag local-only">local-only</span>
+            <span class="lorebook-world-check" title="Checking World Info file…"><i class="fa-solid fa-spinner fa-spin" style="font-size:10px; opacity:0.5;"></i></span>
+        </div>`;
+    }
+
+    // Matched entries with field-level changes
+    for (const m of modified) {
+        const name = lorebookEntryName(m.remote);
+        const changes = m.changedFields.join(', ');
+        entriesHtml += `<div class="lorebook-diff-entry modified" title="Entry matched by key overlap — the following fields differ: ${CoreAPI.escapeHtml(changes)}">
+            <span class="lorebook-diff-badge modified">~</span>
+            <span class="lorebook-diff-entry-name">${CoreAPI.escapeHtml(name)}</span>
+            <span class="lorebook-diff-entry-changes">${CoreAPI.escapeHtml(changes)}</span>
+        </div>`;
+    }
+
+    const unchangedCount = matched.length - modified.length;
+    if (unchangedCount > 0) {
+        entriesHtml += `<div class="lorebook-diff-entry unchanged">
+            <span class="lorebook-diff-unchanged-count">${unchangedCount} unchanged entr${unchangedCount === 1 ? 'y' : 'ies'}</span>
+        </div>`;
+    }
+
+
+
+    return `
+        <div class="card-update-diff-item long-text lorebook">
+            <div class="card-update-diff-header">
+                <label>
+                    <input type="checkbox" id="${checkboxId}" data-field="${diff.field}" checked>
+                    <span class="card-update-diff-label">${CoreAPI.escapeHtml(diff.label)}</span>
+                    <span class="lorebook-entry-counts">
+                        <span class="local-count">${localEntries.length}</span>
+                        <i class="fa-solid fa-arrow-right"></i>
+                        <span class="remote-count">${remoteEntries.length}</span>
+                    </span>
+                </label>
+                <span class="card-update-diff-stats">${stats}</span>
+                <button class="card-update-diff-expand">
+                    <i class="fa-solid fa-chevron-down"></i>
+                </button>
+            </div>
+            <div class="card-update-diff-content collapsed">
+                <div class="lorebook-diff-entries">
+                    ${entriesHtml}
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+/**
+ * Post-render: fetch the linked world file and update each local-only entry
+ * row with a per-entry "safe in World Info" or "not in World Info" badge.
+ */
+async function resolveWorldFileStatus(containerEl, avatar) {
+    if (!containerEl || !avatar) return;
+    const rows = containerEl.querySelectorAll('.lorebook-diff-entry.local-only[data-lb-keys]');
+    if (rows.length === 0) return;
+
+    // Helper: clear spinners and mark all rows as "not in remote" (no world context found)
+    const markAllNoWorld = (reason) => {
+        for (const row of rows) {
+            const check = row.querySelector('.lorebook-world-check');
+            if (check) { check.innerHTML = ''; check.title = ''; }
+            const tag = row.querySelector('.lorebook-diff-entry-tag');
+            if (tag) tag.textContent = 'local-only · no World Info file';
+            row.title = `This entry is in your embedded lorebook but not on the remote card. Applying will remove it from the card. ${reason}`;
+        }
+    };
+
+    try {
+        let worldName = CoreAPI.getCharacterWorldName(avatar);
+
+        // Fallback: if the card has no stored world name, list all world files
+        // and try to match by character name (ST often names the file after the char)
+        if (!worldName) {
+            const charObj = currentUpdateChecks.get(avatar)?.char;
+            const charName = (charObj?.name || '').trim();
+            if (charName) {
+                const allWorlds = (await CoreAPI.listWorldInfoFiles()).map(w => w.file_id);
+                const lower = charName.toLowerCase();
+                worldName = allWorlds.find(w => w.toLowerCase() === lower)
+                         || allWorlds.find(w => w.toLowerCase().includes(lower) || lower.includes(w.toLowerCase()))
+                         || null;
+            }
+        }
+
+        if (!worldName) {
+            markAllNoWorld('No linked World Info file was found.');
+            return;
+        }
+
+        let worldData;
+        try {
+            worldData = await CoreAPI.getWorldInfoData(worldName);
+        } catch (_) { /* fetch failed */ }
+
+        if (!worldData?.entries) {
+            markAllNoWorld(`World Info file "${worldName}" could not be read.`);
+            return;
+        }
+
+        const worldEntries = Object.values(worldData.entries).filter(e => e && typeof e === 'object');
+
+        // Expand keys helper (handles comma-separated values inside key arrays)
+        const expandKeys = (keys) => {
+            const set = new Set();
+            for (const k of (keys || [])) {
+                for (const part of String(k).split(',')) {
+                    const t = part.toLowerCase().trim();
+                    if (t) set.add(t);
+                }
+            }
+            return set;
+        };
+
+        for (const row of rows) {
+            let entryKeys;
+            try { entryKeys = JSON.parse(row.dataset.lbKeys || '[]'); } catch (_) { entryKeys = []; }
+            const entryName = (row.dataset.lbName || '').toLowerCase().trim();
+            const embeddedKeys = expandKeys(entryKeys);
+
+            // Try to find a matching world entry by key overlap or name
+            let found = false;
+            for (const we of worldEntries) {
+                const wKeys = expandKeys(we.key);
+                // Key overlap check
+                if (embeddedKeys.size > 0 && wKeys.size > 0) {
+                    let inter = 0;
+                    for (const k of embeddedKeys) { if (wKeys.has(k)) inter++; }
+                    const union = new Set([...embeddedKeys, ...wKeys]).size;
+                    if (union > 0 && (inter / union) > 0.3) { found = true; break; }
+                }
+                // Name/comment match
+                const wName = (we.comment || '').toLowerCase().trim();
+                if (entryName && wName && (entryName === wName || entryName.includes(wName) || wName.includes(entryName))) {
+                    found = true; break;
+                }
+            }
+
+            const check = row.querySelector('.lorebook-world-check');
+            const tag = row.querySelector('.lorebook-diff-entry-tag');
+            if (found) {
+                if (check) {
+                    check.innerHTML = '<i class="fa-solid fa-shield-halved" style="color: var(--cl-success-pale); font-size: 11px;"></i>';
+                    check.title = `Also exists in World Info file "${worldName}" — safe, won't be affected by applying`;
+                }
+                if (tag) tag.textContent = 'local-only · safe in World Info';
+                row.title = `This entry is in your embedded lorebook but not on the remote. Applying removes it from the card, but it also exists in your World Info file "${worldName}" which is not affected.`;
+            } else {
+                if (check) {
+                    check.innerHTML = '<i class="fa-solid fa-triangle-exclamation" style="color: #ffb74d; font-size: 11px;"></i>';
+                    check.title = `Not found in World Info file "${worldName}" — this entry only exists in the embedded lorebook and will be lost if you apply`;
+                }
+                if (tag) {
+                    tag.textContent = 'local-only · not in World Info';
+                    tag.classList.remove('local-only');
+                    tag.classList.add('warning');
+                }
+                row.title = `This entry exists only in the embedded lorebook (not found in World Info file "${worldName}"). Applying will remove it from the card with no backup elsewhere.`;
+            }
+        }
+    } catch (err) {
+        console.error('[CardUpdates] resolveWorldFileStatus error:', err);
+        markAllNoWorld('World Info check failed.');
+    }
+}
+
+function lorebookEntryName(entry) {
+    if (entry.comment?.trim()) return entry.comment.trim();
+    if (entry.name?.trim()) return entry.name.trim();
+    const keys = entry.keys || [];
+    if (keys.length > 0) return keys.slice(0, 3).join(', ');
+    return `Entry #${entry.id ?? '?'}`;
+}
+
+function matchLorebookEntries(localEntries, remoteEntries) {
+    const matched = [];
+    const usedRemote = new Set();
+    const removed = [];
+
+    // Match by key overlap (Jaccard); forward pass + positional tie-break so an identical lorebook doesnt diff as a wall of fake changes.
+    for (let i = 0; i < localEntries.length; i++) {
+        const local = localEntries[i];
+        let bestIdx = -1;
+        let bestScore = 0;
+
+        for (let j = 0; j < remoteEntries.length; j++) {
+            if (usedRemote.has(j)) continue;
+            const score = lorebookEntryMatchScore(local, remoteEntries[j]);
+            if (score > bestScore || (score === bestScore && score > 0 && bestIdx >= 0 && Math.abs(j - i) < Math.abs(bestIdx - i))) {
+                bestScore = score;
+                bestIdx = j;
+            }
+        }
+
+        if (bestIdx >= 0 && bestScore > 0.3) {
+            usedRemote.add(bestIdx);
+            const changedFields = compareLorebookEntryFields(local, remoteEntries[bestIdx]);
+            matched.push({ local, remote: remoteEntries[bestIdx], changedFields });
+        } else {
+            removed.push(local);
+        }
+    }
+
+    const added = remoteEntries.filter((_, j) => !usedRemote.has(j));
+    return { matched, added, removed };
+}
+
+function lorebookEntryMatchScore(a, b) {
+    // Expand keys: split comma-separated strings into individual keys
+    const expandKeys = (entry) => {
+        const raw = entry.keys || [];
+        const expanded = new Set();
+        for (const k of raw) {
+            for (const part of String(k).split(',')) {
+                const trimmed = part.toLowerCase().trim();
+                if (trimmed) expanded.add(trimmed);
+            }
+        }
+        return expanded;
+    };
+
+    const aKeys = expandKeys(a);
+    const bKeys = expandKeys(b);
+
+    if (aKeys.size > 0 && bKeys.size > 0) {
+        let intersection = 0;
+        for (const k of aKeys) { if (bKeys.has(k)) intersection++; }
+        const union = new Set([...aKeys, ...bKeys]).size;
+        if (union > 0) {
+            const jaccard = intersection / union;
+            if (jaccard > 0) return jaccard;
+        }
+    }
+
+    // Name/comment match (exact or substring)
+    const aName = (a.comment || a.name || '').toLowerCase().trim();
+    const bName = (b.comment || b.name || '').toLowerCase().trim();
+    if (aName && bName) {
+        if (aName === bName) return 1;
+        if (aName.includes(bName) || bName.includes(aName)) return 0.8;
+    }
+
+    // Content similarity fallback - first 200 chars
+    const aCont = (a.content || '').slice(0, 200).toLowerCase().trim();
+    const bCont = (b.content || '').slice(0, 200).toLowerCase().trim();
+    if (aCont.length > 20 && bCont.length > 20 && aCont === bCont) return 0.7;
+
+    return 0;
+}
+
+function normalizeKeysForComparison(arr) {
+    if (!Array.isArray(arr) || arr.length === 0) return [];
+    const expanded = [];
+    for (const k of arr) {
+        for (const part of String(k).split(',')) {
+            const trimmed = part.trim();
+            if (trimmed) expanded.push(trimmed);
+        }
+    }
+    return expanded.sort();
+}
+
+function compareLorebookEntryFields(local, remote) {
+    const changed = [];
+    for (const f of LOREBOOK_ENTRY_FIELDS) {
+        if (f === 'id' || f === 'name' || f === 'comment') continue;
+        if (f === 'keys' || f === 'secondary_keys') {
+            if (JSON.stringify(normalizeKeysForComparison(local[f])) !== JSON.stringify(normalizeKeysForComparison(remote[f]))) {
+                changed.push(f);
+            }
+            continue;
+        }
+        if (JSON.stringify(local[f] ?? null) !== JSON.stringify(remote[f] ?? null)) {
+            changed.push(f);
+        }
+    }
+    return changed;
+}
+
+const LOREBOOK_META_FIELDS = {
+    name: 'Name',
+    description: 'Description',
+    scan_depth: 'Scan Depth',
+    token_budget: 'Token Budget',
+    recursive_scanning: 'Recursive Scanning',
+};
+
+// V2-spec entry fields - everything else (uid, display_index, vectorized, etc.) is ST-internal
+const LOREBOOK_ENTRY_FIELDS = [
+    'keys', 'secondary_keys', 'content', 'enabled', 'selective',
+    'constant', 'position', 'insertion_order', 'priority', 'case_sensitive',
+    'name', 'comment', 'id'
+];
+
+function normalizeLorebookEntry(entry) {
+    const out = {};
+    for (const f of LOREBOOK_ENTRY_FIELDS) {
+        if (entry[f] !== undefined) {
+            out[f] = (f === 'keys' || f === 'secondary_keys') ? normalizeKeysForComparison(entry[f]) : entry[f];
+        }
+    }
+    return out;
+}
+
+// ========================================
+// WORLD INFO ↔ V2 FORMAT CONVERSION
+// ========================================
+//
+// How SillyTavern's lorebook storage works:
+//
+//   character_book (in card PNG)  - Snapshot created at import time. ST does NOT
+//                                   re-embed /worlds data on normal saves.
+//
+//   /worlds/{name}.json           - The live working copy. All edits in ST's
+//                                   World Info editor go here. Linked via
+//                                   char.data.extensions.world.
+//
+// The two copies diverge independently after import.
+//
+// Our approach:
+//   - CHECK: Always compare character_book (embedded) against remote.
+//     World files are never read for diff purposes.
+//   - APPLY: Write the remote lorebook to character_book (clean mirror).
+//     World files are never modified by the update checker.
+//   - If local-only entries would be lost from the embedded lorebook,
+//     the diff UI checks for a linked world file and reassures the user
+//     that their World Info entries are unaffected.
+//
+
+function lorebooksEqual(a, b) {
+    const aEntries = a?.entries || [];
+    const bEntries = b?.entries || [];
+    const aEmpty = aEntries.length === 0;
+    const bEmpty = bEntries.length === 0;
+    if (aEmpty && bEmpty) return true;
+
+    // Compare meta
+    for (const key of Object.keys(LOREBOOK_META_FIELDS)) {
+        if (JSON.stringify(a?.[key] ?? null) !== JSON.stringify(b?.[key] ?? null)) return false;
+    }
+
+    // Compare entries (order-sensitive by spec)
+    if (aEntries.length !== bEntries.length) return false;
+    for (let i = 0; i < aEntries.length; i++) {
+        const na = normalizeLorebookEntry(aEntries[i]);
+        const nb = normalizeLorebookEntry(bEntries[i]);
+        if (JSON.stringify(na) !== JSON.stringify(nb)) return false;
+    }
+    return true;
+}
+
+function hasRemoteLorebookMeta(book) {
+    if (!book) return false;
+    return Object.keys(LOREBOOK_META_FIELDS).some(k => book[k] != null);
+}
+
+function compareLorebookMeta(localBook, remoteBook) {
+    const diffs = [];
+    for (const [key, label] of Object.entries(LOREBOOK_META_FIELDS)) {
+        const lv = localBook?.[key];
+        const rv = remoteBook?.[key];
+        if (JSON.stringify(lv ?? null) !== JSON.stringify(rv ?? null)) {
+            diffs.push({
+                key,
+                label,
+                localStr: lv == null ? '(not set)' : typeof lv === 'object' ? JSON.stringify(lv) : String(lv),
+                remoteStr: rv == null ? '(not set)' : typeof rv === 'object' ? JSON.stringify(rv) : String(rv)
+            });
+        }
+    }
+    return diffs;
+}
+
+function renderArrayList(values, field, otherSide = null) {
+    if (!values || values.length === 0) {
+        return '<div class="card-update-array-list"><span class="card-update-empty">(empty)</span></div>';
+    }
+    // Build a Set of normalized values from the other side for highlighting
+    const otherSet = otherSide ? new Set(otherSide.map(v =>
+        (typeof v === 'string' ? v : JSON.stringify(v)).toLowerCase().trim()
+    )) : null;
+    const items = values.map(value => {
+        const text = typeof value === 'string' ? value : JSON.stringify(value);
+        let classes = field === 'tags' ? 'card-update-pill tag' : 'card-update-pill';
+        // Highlight items that exist only on this side (not in the other)
+        if (otherSet && !otherSet.has(text.toLowerCase().trim())) {
+            classes += ' card-update-pill-unique';
+        }
+        return `<span class="${classes}">${CoreAPI.escapeHtml(text)}</span>`;
+    }).join('');
+
+    return `<div class="card-update-array-list">${items}</div>`;
+}
+
+function formatValueForDisplay(value) {
+    if (value === null || value === undefined) return '(empty)';
+    if (Array.isArray(value)) {
+        if (value.length === 0) return '(empty array)';
+        return value.map((v, i) => `[${i + 1}] ${typeof v === 'string' ? v : JSON.stringify(v)}`).join('\n');
+    }
+    if (typeof value === 'object') return JSON.stringify(value, null, 2);
+    if (typeof value === 'string' && value.trim() === '') return '(empty)';
+    return String(value);
+}
+
+// ========================================
+// BATCH CHECK
+// ========================================
+
+function showBatchCheckModal(characters) {
+    const modal = document.getElementById('cardUpdateBatchModal');
+    const countEl = document.getElementById('cardUpdateBatchCount');
+    const listEl = document.getElementById('cardUpdateBatchList');
+    const progressEl = document.getElementById('cardUpdateBatchProgress');
+    const actionsEl = document.getElementById('cardUpdateBatchActions');
+    const fieldSelectEl = document.getElementById('cardUpdateBatchFieldSelect');
+    const fieldGridEl = document.getElementById('cardUpdateBatchFieldGrid');
+    const fieldCountEl = document.getElementById('cardUpdateBatchFieldCount');
+    const startBtn = document.getElementById('cardUpdateBatchStartBtn');
+    
+    countEl.textContent = characters.length;
+    progressEl.innerHTML = '';
+    actionsEl.style.display = 'none';
+    currentUpdateChecks.clear();
+    pendingBatchCharacters = characters;
+    batchSelectedAvatars.clear();
+    batchStatusFilter = 'all';
+    
+    // Reset filter bar
+    const filterBar = document.getElementById('cardUpdateBatchFilterBar');
+    if (filterBar) filterBar.classList.add('hidden');
+    resetBatchFilterPills();
+    
+    // Hide pre-apply summary if visible
+    const summaryEl = document.getElementById('cardUpdateBatchSummary');
+    if (summaryEl) summaryEl.classList.add('hidden');
+    
+    // Determine which providers are represented in this batch
+    const representedProviders = new Set();
+    for (const char of characters) {
+        const linkInfo = getProviderLinkInfo(char);
+        if (linkInfo?.providerId) representedProviders.add(linkInfo.providerId);
+    }
+
+    // Build relevant fields - base fields always included, provider fields only if that provider is represented
+    batchRelevantFields = new Set();
+    for (const field of Object.keys(COMPARABLE_FIELDS)) {
+        const ownerProvider = fieldProviderMap[field];
+        if (!ownerProvider || representedProviders.has(ownerProvider)) {
+            batchRelevantFields.add(field);
+        }
+    }
+
+    // Reset selection to all relevant fields so previous-run pruning doesn't carry over
+    batchFieldSelection = new Set(batchRelevantFields);
+
+    // Build field selection grid (only relevant fields)
+    // Grouped fields (e.g. provider taglines) share a single checkbox.
+    if (fieldGridEl) {
+        const groupedPaths = new Set();
+        for (const g of Object.values(fieldGroups)) {
+            for (const p of g.paths) groupedPaths.add(p);
+        }
+
+        const items = [];
+
+        // Ungrouped fields first
+        for (const field of batchRelevantFields) {
+            if (groupedPaths.has(field)) continue;
+            const label = COMPARABLE_FIELDS[field];
+            const isChecked = batchFieldSelection.has(field);
+            items.push(`
+                <label class="card-update-field-option">
+                    <input type="checkbox" data-field="${field}" ${isChecked ? 'checked' : ''}>
+                    <span class="card-update-field-label">${CoreAPI.escapeHtml(label)}</span>
+                </label>
+            `);
+        }
+
+        // Grouped fields - one checkbox per group (only if any path in the group is relevant)
+        for (const [groupName, group] of Object.entries(fieldGroups)) {
+            const relevantPaths = group.paths.filter(p => batchRelevantFields.has(p));
+            if (relevantPaths.length === 0) continue;
+            const allChecked = relevantPaths.every(p => batchFieldSelection.has(p));
+            items.push(`
+                <label class="card-update-field-option">
+                    <input type="checkbox" data-group="${groupName}" ${allChecked ? 'checked' : ''}>
+                    <span class="card-update-field-label">${CoreAPI.escapeHtml(group.label)}</span>
+                </label>
+            `);
+        }
+
+        fieldGridEl.innerHTML = items.join('');
+    }
+
+    if (fieldCountEl) {
+        updateBatchFieldCount();
+    }
+
+    if (fieldSelectEl) fieldSelectEl.classList.remove('hidden');
+    listEl.classList.add('hidden');
+    progressEl.classList.add('hidden');
+    
+    // Reset state
+    batchCheckPaused = false;
+    batchCheckRunning = false;
+    batchCheckedCount = 0;
+    updateBatchFooter('idle');
+    updateSourceBadge(modal);
+    
+    modal.classList.add('visible');
+}
+
+/**
+ * Perform batch update check
+ * @param {Array} characters - Characters to check
+ */
+async function performBatchCheck(characters, allowedFields, startFrom = 0) {
+    const progressEl = document.getElementById('cardUpdateBatchProgress');
+    
+    abortController = new AbortController();
+    batchCheckRunning = true;
+    batchCheckPaused = false;
+    updateBatchFooter('checking');
+    
+    let withUpdates = currentUpdateChecks.size;
+    let errors = 0;
+    
+    for (let i = startFrom; i < characters.length; i++) {
+        if (abortController.signal.aborted || batchCheckPaused) break;
+        
+        const char = characters[i];
+        const itemEl = document.querySelector(`.card-update-batch-item[data-avatar="${CSS.escape(char.avatar)}"]`);
+        const statusEl = itemEl?.querySelector('.card-update-batch-item-status');
+        
+        // Skip already-checked items
+        const curStatus = statusEl?.textContent?.trim() || '';
+        if (curStatus.includes('Up to date') || curStatus.includes('update') || 
+            curStatus.includes('Updated') || curStatus.includes('Failed') || curStatus.includes('Error') ||
+            curStatus.includes('Removed') || curStatus.includes('Locked')) {
+            continue;
+        }
+        
+        if (statusEl) {
+            statusEl.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Checking...';
+        }
+        
+        try {
+            const match = CoreAPI.getCharacterProvider(char);
+            if (!match) {
+                if (statusEl) statusEl.innerHTML = '<i class="fa-solid fa-exclamation-triangle"></i> No provider';
+                if (itemEl) itemEl.dataset.status = 'errors';
+                errors++;
+                continue;
+            }
+
+            await match.provider.refreshRemoteData(match.linkInfo, {
+                signal: abortController.signal,
+                onStatus: statusEl ? (msg) => {
+                    statusEl.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> ${CoreAPI.escapeHtml(msg)}`;
+                } : undefined,
+            });
+
+            if (abortController.signal.aborted || batchCheckPaused) break;
+            const remoteCard = await match.provider.fetchRemoteCard(match.linkInfo);
+            
+            if (!remoteCard) {
+                if (statusEl) statusEl.innerHTML = '<i class="fa-solid fa-ghost"></i> Removed / Private';
+                if (itemEl) itemEl.dataset.status = 'unavailable';
+                // Auto-uncheck -- nothing to apply
+                batchSelectedAvatars.delete(char.avatar);
+                const cb = itemEl?.querySelector('.card-update-batch-checkbox');
+                if (cb) { cb.checked = false; cb.disabled = true; }
+                errors++;
+            } else {
+                // Ensure heavy fields are loaded before comparing card content
+                await CoreAPI.hydrateCharacter(char);
+                const localData = char.data || char;
+
+                const diffs = compareCards(localData, remoteCard, allowedFields);
+                
+                if (diffs.length === 0) {
+                    if (statusEl) statusEl.innerHTML = '<i class="fa-solid fa-check" style="color: var(--cl-success);"></i> Up to date';
+                    if (itemEl) itemEl.dataset.status = 'up-to-date';
+                } else {
+                    if (statusEl) {
+                        const fieldIcons = diffs.map(d => fieldIcon(d.field)).join('');
+                        statusEl.innerHTML = `
+                            <span class="has-updates">${diffs.length} update${diffs.length > 1 ? 's' : ''}</span>
+                            <span class="card-update-batch-item-fields">${fieldIcons}</span>
+                            <button class="card-update-batch-view-btn" data-view-avatar="${CoreAPI.escapeHtml(char.avatar)}">
+                                View
+                            </button>
+                        `;
+                    }
+                    if (itemEl) itemEl.dataset.status = 'has-updates';
+                    currentUpdateChecks.set(char.avatar, { char, localData, remoteCard, diffs });
+                    withUpdates++;
+                }
+            }
+        } catch (error) {
+            console.error('[CardUpdates] Batch check error for:', char.avatar, error);
+            if (statusEl) statusEl.innerHTML = '<i class="fa-solid fa-xmark"></i> Error';
+            if (itemEl) itemEl.dataset.status = 'error';
+            errors++;
+        }
+        
+        batchCheckedCount++;
+        progressEl.innerHTML = `Checked ${batchCheckedCount}/${characters.length}`;
+        updateBatchFooter('checking');
+        updateBatchFilterCounts();
+    }
+    
+    batchCheckRunning = false;
+    
+    if (batchCheckPaused) {
+        progressEl.innerHTML = `Paused -- Checked ${batchCheckedCount}/${characters.length}`;
+        updateBatchFooter('paused');
+    } else {
+        const unavailableCount = document.querySelectorAll('#cardUpdateBatchList .card-update-batch-item[data-status="unavailable"]').length;
+        const realErrors = errors - unavailableCount;
+        let doneMsg = `Done! ${withUpdates} with updates`;
+        if (unavailableCount > 0) doneMsg += `, ${unavailableCount} unavailable`;
+        if (realErrors > 0) doneMsg += `, ${realErrors} error${realErrors !== 1 ? 's' : ''}`;
+        progressEl.innerHTML = doneMsg;
+        updateBatchFooter('done');
+    }
+    updateBatchFilterCounts();
+}
+
+/**
+ * View diffs for a character from batch view
+ * @param {string} avatar - Character avatar
+ */
+function viewBatchItemDiffs(avatar) {
+    const checkData = currentUpdateChecks.get(avatar);
+    if (!checkData) return;
+    
+    // Show in single modal overlaid
+    const { char, diffs } = checkData;
+    showSingleCheckModal(char);
+    
+    const statusEl = document.getElementById('cardUpdateSingleStatus');
+    const contentEl = document.getElementById('cardUpdateSingleContent');
+    const applyBtn = document.getElementById('cardUpdateSingleApplyBtn');
+    
+    statusEl.innerHTML = `<i class="fa-solid fa-arrow-right-arrow-left"></i> Found ${diffs.length} difference${diffs.length > 1 ? 's' : ''}`;
+    contentEl.innerHTML = renderDiffList(diffs);
+    resolveWorldFileStatus(contentEl, checkData.char?.avatar).catch(e => console.error('[CardUpdates] World status check failed:', e));
+    applyBtn.disabled = false;
+}
+
+// ========================================
+// APPLY UPDATES
+// ========================================
+
+async function applyListingName(char, remoteCard) {
+    const listingName = remoteCard?._listingName;
+    if (!listingName) return;
+    const match = CoreAPI.getCharacterProvider(char);
+    if (!match) return;
+    const { provider } = match;
+    const extKey = provider.id;
+    // Route through applyCardFieldUpdates so the preflight cleans null pollution before the leaf write, and in-memory state stays synced.
+    const success = await CoreAPI.applyCardFieldUpdates(char.avatar, {
+        [`extensions.${extKey}.pageName`]: listingName,
+    });
+    if (success) {
+        // _lowerListingName is CL search-key state, not part of card data - recompute outside the helper.
+        char._lowerListingName = listingName.toLowerCase();
+    }
+}
+
+/**
+ * Apply selected updates for a single character
+ */
+async function applySingleUpdates() {
+    const modal = document.getElementById('cardUpdateSingleModal');
+    const checkboxes = modal.querySelectorAll('.card-update-diff-item input[type="checkbox"]:checked');
+    
+    if (checkboxes.length === 0) {
+        CoreAPI.showToast('No updates selected', 'warning');
+        return;
+    }
+    
+    // Retrieve avatar from JS variable (not from HTML) to avoid special-character issues
+    const avatar = singleModalAvatar;
+    const checkData = avatar ? currentUpdateChecks.get(avatar) : null;
+    if (!checkData) return;
+    
+    const { char, diffs, remoteCard } = checkData;
+    const remoteData = remoteCard?.data || remoteCard;
+    
+    // Build updated data object
+    const updatedFields = {};
+    let hasListingName = false;
+    checkboxes.forEach(cb => {
+        const field = cb.dataset.field;
+        if (field === 'listing_name') { hasListingName = true; return; }
+        const remoteValue = getFieldValue(remoteData, field);
+        // null means "clear this field" - undefined would be silently dropped by JSON
+        updatedFields[field] = remoteValue ?? null;
+    });
+    
+    // Apply via CoreAPI
+    try {
+        // Auto-snapshot before update
+        const versionsModule = CoreAPI.getModule('character-versions');
+        if (versionsModule?.autoSnapshotBeforeChange) {
+            try { await versionsModule.autoSnapshotBeforeChange(char, 'update'); } catch (_) {}
+        }
+        if (hasListingName) await applyListingName(char, remoteCard);
+        const hasCardFields = Object.keys(updatedFields).length > 0;
+        const success = hasCardFields ? await CoreAPI.applyCardFieldUpdates(char.avatar, updatedFields) : true;
+        
+        if (success) {
+            // tagline is a namespace-derived search key; refresh it after the write
+            char._lowerTagline = CoreAPI.getDisplayTagline(char).toLowerCase();
+            CoreAPI.showToast(`Updated ${checkboxes.length} field${checkboxes.length > 1 ? 's' : ''}`, 'success');
+            closeSingleModal();
+            
+            // Update batch list if visible
+            const batchItem = document.querySelector(`.card-update-batch-item[data-avatar="${CSS.escape(avatar)}"]`);
+            if (batchItem) {
+                const statusEl = batchItem.querySelector('.card-update-batch-item-status');
+                if (statusEl) {
+                    statusEl.innerHTML = '<i class="fa-solid fa-check" style="color: var(--cl-success);"></i> Updated';
+                }
+                batchItem.dataset.status = 'applied';
+                updateBatchFilterCounts();
+            }
+            
+            currentUpdateChecks.delete(avatar);
+        } else {
+            CoreAPI.showToast('Failed to apply updates', 'error');
+        }
+    } catch (error) {
+        console.error('[CardUpdates] Apply failed:', error);
+        CoreAPI.showToast('Error applying updates', 'error');
+    }
+}
+
+/**
+ * Show pre-apply summary before applying batch updates.
+ * Groups changes by field across selected characters so the user can review.
+ */
+function showPreApplySummary() {
+    // Build entries from selected characters that have updates
+    const entries = Array.from(currentUpdateChecks.entries())
+        .filter(([avatar]) => batchSelectedAvatars.has(avatar));
+    
+    if (entries.length === 0) {
+        CoreAPI.showToast('No characters selected for update', 'info');
+        return;
+    }
+    
+    // Group changes by field
+    const fieldMap = new Map(); // field -> [{ avatar, charName, diff }]
+    let totalFieldChanges = 0;
+    for (const [avatar, checkData] of entries) {
+        const charName = CoreAPI.getCharacterName(checkData.char) || 'Unknown';
+        for (const diff of checkData.diffs) {
+            if (!fieldMap.has(diff.field)) fieldMap.set(diff.field, []);
+            fieldMap.get(diff.field).push({ avatar, charName, diff });
+            totalFieldChanges++;
+        }
+    }
+    
+    // Build summary HTML
+    let summaryHtml = `
+        <div class="batch-summary-header">
+            <i class="fa-solid fa-clipboard-check"></i>
+            <div>
+                <strong>${entries.length} character${entries.length !== 1 ? 's' : ''}</strong> with
+                <strong>${totalFieldChanges} field change${totalFieldChanges !== 1 ? 's' : ''}</strong>
+            </div>
+        </div>
+        <div class="batch-summary-fields">
+    `;
+    
+    for (const [field, items] of fieldMap) {
+        const label = COMPARABLE_FIELDS[field] || field;
+        summaryHtml += `
+            <div class="batch-summary-field-group">
+                <div class="batch-summary-field-name">
+                    ${fieldIcon(field)}
+                    <span>${CoreAPI.escapeHtml(label)}</span>
+                    <span class="batch-summary-field-count">${items.length} character${items.length !== 1 ? 's' : ''}</span>
+                </div>
+            </div>
+        `;
+    }
+    
+    summaryHtml += `</div>`;
+    
+    // Per-character deselection (last-chance)
+    summaryHtml += `
+        <div class="batch-summary-chars-header">
+            <span>Characters to update</span>
+            <label class="batch-summary-toggle-all">
+                <input type="checkbox" id="batchSummaryToggleAll" checked>
+                <span>Select All</span>
+            </label>
+        </div>
+        <div class="batch-summary-char-list">
+    `;
+    
+    for (const [avatar, checkData] of entries) {
+        const charName = CoreAPI.getCharacterName(checkData.char) || 'Unknown';
+        const fieldIconsHtml = checkData.diffs.map(d => fieldIcon(d.field)).join('');
+        summaryHtml += `
+            <div class="batch-summary-char-item" data-avatar="${CoreAPI.escapeHtml(avatar)}">
+                <input type="checkbox" class="batch-summary-char-cb" data-avatar="${CoreAPI.escapeHtml(avatar)}" checked>
+                <div class="batch-summary-char-info">
+                    <span class="batch-summary-char-name card-update-char-link" data-char-avatar="${CoreAPI.escapeHtml(avatar)}">${CoreAPI.escapeHtml(charName)}</span>
+                    <span class="batch-summary-char-fields">${fieldIconsHtml}</span>
+                </div>
+            </div>
+        `;
+    }
+    
+    summaryHtml += `</div>`;
+    
+    // Show summary section, hide list
+    const summaryEl = document.getElementById('cardUpdateBatchSummary');
+    const listEl = document.getElementById('cardUpdateBatchList');
+    const filterBar = document.getElementById('cardUpdateBatchFilterBar');
+    const progressEl = document.getElementById('cardUpdateBatchProgress');
+    
+    if (summaryEl) {
+        summaryEl.innerHTML = summaryHtml;
+        summaryEl.classList.remove('hidden');
+    }
+    if (listEl) listEl.classList.add('hidden');
+    if (filterBar) filterBar.classList.add('hidden');
+    if (progressEl) progressEl.classList.add('hidden');
+    
+    // Switch footer to summary mode
+    updateBatchFooter('summary');
+}
+
+/**
+ * Go back from pre-apply summary to the batch list
+ */
+function hidePreApplySummary() {
+    const summaryEl = document.getElementById('cardUpdateBatchSummary');
+    const listEl = document.getElementById('cardUpdateBatchList');
+    const filterBar = document.getElementById('cardUpdateBatchFilterBar');
+    const progressEl = document.getElementById('cardUpdateBatchProgress');
+    
+    if (summaryEl) summaryEl.classList.add('hidden');
+    if (listEl) listEl.classList.remove('hidden');
+    if (filterBar) filterBar.classList.remove('hidden');
+    if (progressEl) progressEl.classList.remove('hidden');
+    
+    // Restore footer state
+    if (batchCheckPaused && batchCheckedCount < pendingBatchCharacters.length) {
+        updateBatchFooter('paused');
+    } else {
+        updateBatchFooter('done');
+    }
+}
+
+/**
+ * Apply updates for characters selected in the pre-apply summary
+ */
+async function applyAllBatchUpdates() {
+    // Read which characters are checked in the summary
+    const summaryEl = document.getElementById('cardUpdateBatchSummary');
+    let selectedAvatars;
+    
+    if (summaryEl && !summaryEl.classList.contains('hidden')) {
+        // Summary is visible -- apply only checked characters
+        const checkboxes = summaryEl.querySelectorAll('.batch-summary-char-cb:checked');
+        selectedAvatars = new Set(Array.from(checkboxes).map(cb => cb.dataset.avatar));
+    } else {
+        // Direct apply (shouldn't happen in normal flow, but handle gracefully)
+        selectedAvatars = new Set(batchSelectedAvatars);
+    }
+    
+    const entries = Array.from(currentUpdateChecks.entries())
+        .filter(([avatar]) => selectedAvatars.has(avatar));
+    
+    if (entries.length === 0) {
+        CoreAPI.showToast('No updates to apply', 'info');
+        return;
+    }
+    const progressWrap = document.getElementById('cardUpdateBatchApplyProgress');
+    const progressText = document.getElementById('cardUpdateBatchApplyText');
+    const progressFill = document.getElementById('cardUpdateBatchApplyFill');
+    const actionsEl = document.getElementById('cardUpdateBatchActions');
+    if (actionsEl) actionsEl.style.display = 'none';
+    if (progressWrap) progressWrap.style.display = 'flex';
+    if (progressFill) progressFill.style.width = '0%';
+
+    let successCount = 0;
+    let errorCount = 0;
+    let processed = 0;
+    const total = entries.length;
+    
+    for (const [avatar, checkData] of entries) {
+        const { char, diffs, remoteCard } = checkData;
+        const remoteData = remoteCard?.data || remoteCard;
+        
+        // Apply all diffs for this character
+        const updatedFields = {};
+        let hasListingName = false;
+        for (const diff of diffs) {
+            if (diff.field === 'listing_name') { hasListingName = true; continue; }
+            const remoteValue = getFieldValue(remoteData, diff.field);
+            updatedFields[diff.field] = remoteValue ?? null;
+        }
+        
+        try {
+            // Auto-snapshot before batch update
+            const versionsModule = CoreAPI.getModule('character-versions');
+            if (versionsModule?.autoSnapshotBeforeChange) {
+                try { await versionsModule.autoSnapshotBeforeChange(char, 'update'); } catch (_) {}
+            }
+            if (hasListingName) await applyListingName(char, remoteCard);
+            const hasCardFields = Object.keys(updatedFields).length > 0;
+            const success = hasCardFields ? await CoreAPI.applyCardFieldUpdates(avatar, updatedFields) : true;
+            
+            if (success) {
+                char._lowerTagline = CoreAPI.getDisplayTagline(char).toLowerCase();
+                successCount++;
+                
+                // Update batch list
+                const batchItem = document.querySelector(`.card-update-batch-item[data-avatar="${CSS.escape(avatar)}"]`);
+                if (batchItem) {
+                    const statusEl = batchItem.querySelector('.card-update-batch-item-status');
+                    if (statusEl) {
+                        statusEl.innerHTML = '<i class="fa-solid fa-check" style="color: var(--cl-success);"></i> Updated';
+                    }
+                    batchItem.dataset.status = 'applied';
+                }
+            } else {
+                errorCount++;
+            }
+        } catch (error) {
+            console.error('[CardUpdates] Batch apply error for:', avatar, error);
+            errorCount++;
+        }
+
+        processed++;
+        const percent = Math.round((processed / total) * 100);
+        if (progressText) {
+            progressText.textContent = `Applying updates... ${processed}/${total}`;
+        }
+        if (progressFill) {
+            progressFill.style.width = `${percent}%`;
+        }
+    }
+    
+    currentUpdateChecks.clear();
+    
+    CoreAPI.showToast(`Updated ${successCount} character${successCount !== 1 ? 's' : ''}${errorCount > 0 ? `, ${errorCount} failed` : ''}`, 
+        errorCount > 0 ? 'warning' : 'success');
+    
+    if (progressWrap) progressWrap.style.display = 'none';
+    if (progressFill) progressFill.style.width = '0%';
+    
+    // Return from summary to list view
+    hidePreApplySummary();
+    updateBatchFilterCounts();
+    
+    // Update footer: if we were paused and unchecked characters remain, show resume; otherwise done
+    if (batchCheckPaused && batchCheckedCount < pendingBatchCharacters.length) {
+        updateBatchFooter('paused');
+    } else {
+        updateBatchFooter('done');
+    }
+}
+
+// ========================================
+// MODAL MANAGEMENT
+// ========================================
+
+function closeSingleModal() {
+    singleModalAvatar = null;
+    singleModalClosedAt = Date.now();
+    document.getElementById('cardUpdateSingleModal')?.classList.remove('visible');
+}
+
+/**
+ * Show or refresh the source badge in a modal header.
+ * Shows the provider name for the linked character(s).
+ */
+function updateSourceBadge(modal, char) {
+    const header = modal?.querySelector('.cl-modal-header');
+    if (!header) return;
+    let badge = header.querySelector('.card-update-source-badge');
+    if (!badge) {
+        badge = document.createElement('span');
+        badge.className = 'card-update-source-badge';
+        header.querySelector('h3')?.appendChild(badge);
+    }
+
+    if (char) {
+        const linkInfo = getProviderLinkInfo(char);
+        if (linkInfo?.providerId) {
+            const provider = CoreAPI.getProvider?.(linkInfo.providerId);
+            const providerName = provider?.name || linkInfo.providerId;
+            badge.textContent = providerName;
+            badge.title = `Linked to ${providerName}`;
+            badge.style.display = '';
+            return;
+        }
+    }
+
+    // Batch / no character - hide badge (mixed providers)
+    badge.style.display = 'none';
+}
+
+function closeBatchModal() {
+    abortController?.abort();
+    batchCheckPaused = false;
+    batchCheckRunning = false;
+    batchCheckedCount = 0;
+    batchSelectedAvatars.clear();
+    batchStatusFilter = 'all';
+    batchRelevantFields = null;
+    document.getElementById('cardUpdateBatchModal')?.classList.remove('visible');
+    currentUpdateChecks.clear();
+    pendingBatchCharacters = [];
+}
+
+/**
+ * Pause the currently running batch check
+ */
+function pauseBatchCheck() {
+    if (!batchCheckRunning) return;
+    batchCheckPaused = true;
+    abortController?.abort();
+}
+
+/**
+ * Resume a paused batch check
+ */
+function resumeBatchCheck() {
+    if (!batchCheckPaused || batchCheckRunning) return;
+    performBatchCheck(pendingBatchCharacters, new Set(batchFieldSelection), 0);
+}
+
+/**
+ * Update the batch modal footer buttons based on state
+ * @param {'idle'|'checking'|'paused'|'done'} state
+ */
+function updateBatchFooter(state) {
+    const startBtn = document.getElementById('cardUpdateBatchStartBtn');
+    const pauseBtn = document.getElementById('cardUpdateBatchPauseBtn');
+    const applyBtn = document.getElementById('cardUpdateBatchApplyAllBtn');
+    const closeBtn = document.getElementById('cardUpdateBatchCloseFooterBtn');
+    const actionsWrap = document.getElementById('cardUpdateBatchActions');
+    const summaryBackBtn = document.getElementById('cardUpdateBatchSummaryBackBtn');
+    const summaryConfirmBtn = document.getElementById('cardUpdateBatchSummaryConfirmBtn');
+    
+    // Count selected characters that have updates
+    const selectedUpdateCount = Array.from(currentUpdateChecks.keys())
+        .filter(avatar => batchSelectedAvatars.has(avatar)).length;
+    
+    if (applyBtn) {
+        applyBtn.innerHTML = `<i class="fa-solid fa-clipboard-check"></i> Apply All Selected (${selectedUpdateCount})`;
+        applyBtn.disabled = selectedUpdateCount === 0;
+    }
+    
+    // Hide summary buttons by default
+    if (summaryBackBtn) summaryBackBtn.style.display = 'none';
+    if (summaryConfirmBtn) summaryConfirmBtn.style.display = 'none';
+    
+    switch (state) {
+        case 'idle':
+            if (startBtn) { startBtn.style.display = ''; startBtn.disabled = false; }
+            if (pauseBtn) pauseBtn.style.display = 'none';
+            if (actionsWrap) actionsWrap.style.display = 'none';
+            if (closeBtn) closeBtn.style.display = '';
+            break;
+        case 'checking':
+            if (startBtn) startBtn.style.display = 'none';
+            if (pauseBtn) {
+                pauseBtn.style.display = '';
+                pauseBtn.innerHTML = '<i class="fa-solid fa-pause"></i> Pause';
+                pauseBtn.classList.remove('resume');
+                pauseBtn.classList.add('pause');
+            }
+            if (actionsWrap) actionsWrap.style.display = 'none';
+            if (closeBtn) closeBtn.style.display = '';
+            break;
+        case 'paused':
+            if (startBtn) startBtn.style.display = 'none';
+            if (pauseBtn) {
+                pauseBtn.style.display = '';
+                pauseBtn.innerHTML = '<i class="fa-solid fa-play"></i> Resume';
+                pauseBtn.classList.remove('pause');
+                pauseBtn.classList.add('resume');
+            }
+            if (actionsWrap) actionsWrap.style.display = selectedUpdateCount > 0 ? 'flex' : 'none';
+            if (closeBtn) closeBtn.style.display = '';
+            break;
+        case 'done':
+            if (startBtn) startBtn.style.display = 'none';
+            if (pauseBtn) pauseBtn.style.display = 'none';
+            if (actionsWrap) actionsWrap.style.display = selectedUpdateCount > 0 ? 'flex' : 'none';
+            if (closeBtn) closeBtn.style.display = '';
+            break;
+        case 'summary':
+            if (startBtn) startBtn.style.display = 'none';
+            if (pauseBtn) pauseBtn.style.display = 'none';
+            if (actionsWrap) actionsWrap.style.display = 'none';
+            if (closeBtn) closeBtn.style.display = 'none';
+            if (summaryBackBtn) summaryBackBtn.style.display = '';
+            if (summaryConfirmBtn) {
+                summaryConfirmBtn.style.display = '';
+                summaryConfirmBtn.disabled = selectedUpdateCount === 0;
+            }
+            break;
+    }
+}
+
+function updateBatchFieldCount() {
+    const fieldCountEl = document.getElementById('cardUpdateBatchFieldCount');
+    if (!fieldCountEl) return;
+
+    // Count visible items (groups count as 1, ungrouped fields count as 1 each)
+    const grid = document.getElementById('cardUpdateBatchFieldGrid');
+    if (!grid) return;
+    const allCheckboxes = grid.querySelectorAll('input[type="checkbox"]');
+    let checked = 0;
+    allCheckboxes.forEach(cb => { if (cb.checked) checked++; });
+    fieldCountEl.textContent = `${checked}/${allCheckboxes.length}`;
+}
+
+function handleBatchFieldSelectionChange(e) {
+    // Group checkbox - toggles all paths in the group
+    const groupCheckbox = e.target.closest('input[type="checkbox"][data-group]');
+    if (groupCheckbox) {
+        const group = fieldGroups[groupCheckbox.dataset.group];
+        if (group) {
+            for (const path of group.paths) {
+                if (groupCheckbox.checked) batchFieldSelection.add(path);
+                else batchFieldSelection.delete(path);
+            }
+        }
+        updateBatchFieldCount();
+        return;
+    }
+
+    // Individual field checkbox
+    const checkbox = e.target.closest('input[type="checkbox"][data-field]');
+    if (!checkbox) return;
+    const field = checkbox.dataset.field;
+    if (!field) return;
+    if (checkbox.checked) {
+        batchFieldSelection.add(field);
+    } else {
+        batchFieldSelection.delete(field);
+    }
+    updateBatchFieldCount();
+}
+
+function setBatchFieldsChecked(checked) {
+    const grid = document.getElementById('cardUpdateBatchFieldGrid');
+    if (!grid) return;
+
+    // Individual field checkboxes
+    const fieldCBs = grid.querySelectorAll('input[type="checkbox"][data-field]');
+    fieldCBs.forEach(cb => { cb.checked = checked; });
+
+    // Group checkboxes
+    const groupCBs = grid.querySelectorAll('input[type="checkbox"][data-group]');
+    groupCBs.forEach(cb => { cb.checked = checked; });
+
+    // Rebuild selection from scratch
+    batchFieldSelection.clear();
+    if (checked && batchRelevantFields) {
+        for (const f of batchRelevantFields) batchFieldSelection.add(f);
+    }
+    updateBatchFieldCount();
+}
+
+function startBatchCheck() {
+    if (!pendingBatchCharacters || pendingBatchCharacters.length === 0) return;
+    if (batchFieldSelection.size === 0) {
+        CoreAPI.showToast('Select at least one field to compare', 'warning');
+        return;
+    }
+
+    const listEl = document.getElementById('cardUpdateBatchList');
+    const progressEl = document.getElementById('cardUpdateBatchProgress');
+    const fieldSelectEl = document.getElementById('cardUpdateBatchFieldSelect');
+
+    // Reset counters
+    batchCheckedCount = 0;
+    currentUpdateChecks.clear();
+    batchSelectedAvatars.clear();
+
+    // Build initial list with checkboxes
+    listEl.innerHTML = pendingBatchCharacters.map(char => {
+        const providerLink = getProviderLinkInfo(char);
+        const name = CoreAPI.getCharacterName(char) || 'Unknown';
+        const locked = CoreAPI.isUpdateLocked(char);
+        if (!locked) batchSelectedAvatars.add(char.avatar);
+        return `
+            <div class="card-update-batch-item" data-avatar="${CoreAPI.escapeHtml(char.avatar)}" data-status="${locked ? 'locked' : 'pending'}">
+                <label class="card-update-batch-item-check">
+                    <input type="checkbox" class="card-update-batch-checkbox" data-avatar="${CoreAPI.escapeHtml(char.avatar)}" ${locked ? 'disabled' : 'checked'}>
+                </label>
+                <div class="card-update-batch-item-info">
+                    <span class="card-update-batch-item-name card-update-char-link" data-char-avatar="${CoreAPI.escapeHtml(char.avatar)}">${CoreAPI.escapeHtml(name)}</span>
+                    <span class="card-update-batch-item-path">${CoreAPI.escapeHtml(providerLink?.fullPath || '')}</span>
+                </div>
+                <div class="card-update-batch-item-status">
+                    ${locked
+                        ? '<i class="fa-solid fa-lock"></i> Locked'
+                        : '<i class="fa-solid fa-clock"></i> Pending'}
+                </div>
+                <button class="card-update-lock-toggle" data-avatar="${CoreAPI.escapeHtml(char.avatar)}" title="${locked ? 'Unlock and check' : 'Lock updates'}">
+                    <i class="fa-solid ${locked ? 'fa-lock' : 'fa-unlock'}"></i>
+                </button>
+            </div>
+        `;
+    }).join('');
+
+    if (fieldSelectEl) fieldSelectEl.classList.add('hidden');
+    listEl.classList.remove('hidden');
+    progressEl.classList.remove('hidden');
+
+    // Show filter bar (counters update as results come in)
+    const filterBar = document.getElementById('cardUpdateBatchFilterBar');
+    if (filterBar) filterBar.classList.remove('hidden');
+    updateBatchFilterCounts();
+
+    performBatchCheck(pendingBatchCharacters, new Set(batchFieldSelection), 0);
+}
+
+// ========================================
+// BATCH FILTERING & SELECTION
+// ========================================
+
+async function toggleBatchItemLock(avatar) {
+    const allChars = CoreAPI.getAllCharacters();
+    const char = allChars.find(c => c.avatar === avatar);
+    if (!char) return;
+
+    const itemEl = document.querySelector(`.card-update-batch-item[data-avatar="${CSS.escape(avatar)}"]`);
+    const statusEl = itemEl?.querySelector('.card-update-batch-item-status');
+    const toggleBtn = itemEl?.querySelector('.card-update-lock-toggle');
+    if (!itemEl) return;
+
+    const wasLocked = CoreAPI.isUpdateLocked(char);
+
+    try {
+        await CoreAPI.setUpdateLocked(avatar, !wasLocked);
+    } catch (err) {
+        console.error('[CardUpdates] Failed to toggle lock:', err);
+        CoreAPI.showToast('Failed to toggle update lock', 'error');
+        return;
+    }
+
+    if (wasLocked) {
+        // Unlock: reset to pending and re-check
+        itemEl.dataset.status = 'pending';
+        if (statusEl) statusEl.innerHTML = '<i class="fa-solid fa-clock"></i> Pending';
+        const cb = itemEl.querySelector('.card-update-batch-checkbox');
+        if (cb) { cb.disabled = false; cb.checked = true; }
+        batchSelectedAvatars.add(avatar);
+        if (toggleBtn) {
+            toggleBtn.title = 'Lock updates';
+            toggleBtn.innerHTML = '<i class="fa-solid fa-unlock"></i>';
+        }
+        updateBatchFilterCounts();
+        const stateA = batchCheckRunning ? 'checking' : batchCheckPaused ? 'paused' : 'done';
+        updateBatchFooter(stateA);
+
+        if (!batchCheckRunning) {
+            performBatchCheck(pendingBatchCharacters, new Set(batchFieldSelection), 0);
+        }
+    } else {
+        // Lock: set to locked status
+        itemEl.dataset.status = 'locked';
+        if (statusEl) statusEl.innerHTML = '<i class="fa-solid fa-lock"></i> Locked';
+        const cb = itemEl.querySelector('.card-update-batch-checkbox');
+        if (cb) { cb.checked = false; cb.disabled = true; }
+        batchSelectedAvatars.delete(avatar);
+        currentUpdateChecks.delete(avatar);
+        if (toggleBtn) {
+            toggleBtn.title = 'Unlock and check';
+            toggleBtn.innerHTML = '<i class="fa-solid fa-lock"></i>';
+        }
+        updateBatchFilterCounts();
+        const stateB = batchCheckRunning ? 'checking' : batchCheckPaused ? 'paused' : 'done';
+        updateBatchFooter(stateB);
+    }
+}
+
+/**
+ * Count batch items by status and update filter pill badges
+ */
+function updateBatchFilterCounts() {
+    const items = document.querySelectorAll('#cardUpdateBatchList .card-update-batch-item');
+    const counts = { all: 0, 'has-updates': 0, 'up-to-date': 0, errors: 0, unavailable: 0, locked: 0, applied: 0 };
+    
+    for (const item of items) {
+        counts.all++;
+        const status = item.dataset.status || 'pending';
+        if (status === 'has-updates') counts['has-updates']++;
+        else if (status === 'up-to-date') counts['up-to-date']++;
+        else if (status === 'error') counts.errors++;
+        else if (status === 'unavailable') counts.unavailable++;
+        else if (status === 'locked') counts.locked++;
+        else if (status === 'applied') counts.applied++;
+    }
+    
+    const ids = {
+        all: 'batchFilterCountAll',
+        'has-updates': 'batchFilterCountUpdates',
+        'up-to-date': 'batchFilterCountUpToDate',
+        errors: 'batchFilterCountErrors',
+        unavailable: 'batchFilterCountUnavailable',
+        locked: 'batchFilterCountLocked',
+        applied: 'batchFilterCountApplied'
+    };
+    
+    for (const [key, id] of Object.entries(ids)) {
+        const el = document.getElementById(id);
+        if (el) el.textContent = counts[key];
+    }
+    
+    // Re-apply active filter so newly checked items show/hide during scan
+    if (batchStatusFilter !== 'all') {
+        applyBatchStatusFilter(batchStatusFilter);
+    }
+}
+
+/**
+ * Filter batch list items by status category
+ */
+function applyBatchStatusFilter(filter) {
+    batchStatusFilter = filter;
+    
+    // Update active pill
+    const pills = document.querySelectorAll('#cardUpdateBatchFilterBar .card-update-filter-pill');
+    for (const pill of pills) {
+        pill.classList.toggle('active', pill.dataset.filter === filter);
+    }
+    
+    // Show/hide items
+    const items = document.querySelectorAll('#cardUpdateBatchList .card-update-batch-item');
+    for (const item of items) {
+        if (filter === 'all') {
+            item.style.display = '';
+        } else {
+            const status = item.dataset.status || 'pending';
+            const matches = (filter === 'errors' && status === 'error')
+                || (filter === 'unavailable' && status === 'unavailable')
+                || (filter === 'locked' && status === 'locked')
+                || (filter === status);
+            item.style.display = matches ? '' : 'none';
+        }
+    }
+}
+
+/**
+ * Reset filter pills to default state
+ */
+function resetBatchFilterPills() {
+    const pills = document.querySelectorAll('#cardUpdateBatchFilterBar .card-update-filter-pill');
+    for (const pill of pills) {
+        pill.classList.toggle('active', pill.dataset.filter === 'all');
+    }
+    const ids = ['batchFilterCountAll', 'batchFilterCountUpdates', 'batchFilterCountUpToDate', 'batchFilterCountErrors', 'batchFilterCountUnavailable', 'batchFilterCountLocked', 'batchFilterCountApplied'];
+    for (const id of ids) {
+        const el = document.getElementById(id);
+        if (el) el.textContent = '0';
+    }
+}
+
+/**
+ * Handle batch item checkbox toggle
+ */
+function handleBatchCheckboxChange(e) {
+    const cb = e.target.closest('.card-update-batch-checkbox');
+    if (!cb) return;
+    const avatar = cb.dataset.avatar;
+    if (!avatar) return;
+    
+    if (cb.checked) {
+        batchSelectedAvatars.add(avatar);
+    } else {
+        batchSelectedAvatars.delete(avatar);
+    }
+    
+    // Refresh footer count
+    const state = batchCheckRunning ? 'checking' : batchCheckPaused ? 'paused' : 'done';
+    updateBatchFooter(state);
+}
+
+/**
+ * Select or deselect all visible batch item checkboxes
+ */
+function setBatchItemsChecked(checked) {
+    const items = document.querySelectorAll('#cardUpdateBatchList .card-update-batch-item');
+    for (const item of items) {
+        if (item.style.display === 'none') continue; // skip filtered-out
+        const cb = item.querySelector('.card-update-batch-checkbox');
+        if (!cb || cb.disabled) continue; // skip unavailable cards
+        cb.checked = checked;
+        const avatar = cb.dataset.avatar;
+        if (checked) batchSelectedAvatars.add(avatar);
+        else batchSelectedAvatars.delete(avatar);
+    }
+    const state = batchCheckRunning ? 'checking' : batchCheckPaused ? 'paused' : 'done';
+    updateBatchFooter(state);
+}
+
+// ========================================
+// UI HELPERS (exposed to window)
+// ========================================
+
+/**
+ * Toggle all checkboxes for a character's diffs
+ */
+function toggleAllCheckboxes(checked) {
+    const modal = document.getElementById('cardUpdateSingleModal');
+    modal.querySelectorAll(`.card-update-diff-item input[type="checkbox"]`).forEach(cb => {
+        cb.checked = checked;
+    });
+}
+
+/**
+ * Toggle expand/collapse of a diff item
+ */
+function toggleExpand(button) {
+    const content = button.closest('.card-update-diff-item').querySelector('.card-update-diff-content');
+    const icon = button.querySelector('i');
+    
+    if (content.classList.contains('collapsed')) {
+        content.classList.remove('collapsed');
+        icon.classList.remove('fa-chevron-down');
+        icon.classList.add('fa-chevron-up');
+    } else {
+        content.classList.add('collapsed');
+        icon.classList.remove('fa-chevron-up');
+        icon.classList.add('fa-chevron-down');
+    }
+}
+
+// ========================================
+// EVENT LISTENERS
+// ========================================
+
+function setupEventListeners() {
+    // Close buttons
+    document.getElementById('cardUpdateSingleCloseBtn')?.addEventListener('click', closeSingleModal);
+    document.getElementById('cardUpdateSingleCancelBtn')?.addEventListener('click', closeSingleModal);
+    document.getElementById('cardUpdateBatchCloseBtn')?.addEventListener('click', closeBatchModal);
+    document.getElementById('cardUpdateBatchCloseFooterBtn')?.addEventListener('click', closeBatchModal);
+    
+    // Apply buttons
+    document.getElementById('cardUpdateSingleApplyBtn')?.addEventListener('click', applySingleUpdates);
+    document.getElementById('cardUpdateBatchApplyAllBtn')?.addEventListener('click', showPreApplySummary);
+    document.getElementById('cardUpdateBatchStartBtn')?.addEventListener('click', startBatchCheck);
+    
+    // Pre-apply summary buttons
+    document.getElementById('cardUpdateBatchSummaryBackBtn')?.addEventListener('click', hidePreApplySummary);
+    document.getElementById('cardUpdateBatchSummaryConfirmBtn')?.addEventListener('click', applyAllBatchUpdates);
+    
+    // Pause/Resume button
+    document.getElementById('cardUpdateBatchPauseBtn')?.addEventListener('click', () => {
+        if (batchCheckRunning && !batchCheckPaused) {
+            pauseBatchCheck();
+        } else if (batchCheckPaused && !batchCheckRunning) {
+            resumeBatchCheck();
+        }
+    });
+    
+    // Single modal: backdrop click + event delegation for diff controls
+    document.getElementById('cardUpdateSingleModal')?.addEventListener('click', (e) => {
+        if (e.target.classList.contains('cl-modal-overlay')) { closeSingleModal(); return; }
+        const expandBtn = e.target.closest('.card-update-diff-expand');
+        if (expandBtn) { toggleExpand(expandBtn); return; }
+    });
+    document.getElementById('cardUpdateSingleModal')?.addEventListener('change', (e) => {
+        if (e.target.classList.contains('card-update-select-all-cb')) {
+            toggleAllCheckboxes(e.target.checked);
+        }
+    });
+    document.getElementById('cardUpdateBatchModal')?.addEventListener('click', (e) => {
+        if (e.target.classList.contains('cl-modal-overlay')) {
+            // Guard against ghost taps that pass through when the single modal just closed
+            if (Date.now() - singleModalClosedAt < 400) return;
+            closeBatchModal();
+        }
+    });
+    
+    // Event delegation for batch list: View buttons, character name clicks, unlock buttons, and checkboxes
+    const batchListEl = document.getElementById('cardUpdateBatchList');
+    batchListEl?.addEventListener('click', (e) => {
+        const viewBtn = e.target.closest('.card-update-batch-view-btn');
+        if (viewBtn) {
+            const avatar = viewBtn.dataset.viewAvatar;
+            if (avatar) viewBatchItemDiffs(avatar);
+            return;
+        }
+        const lockToggle = e.target.closest('.card-update-lock-toggle');
+        if (lockToggle) {
+            const avatar = lockToggle.dataset.avatar;
+            if (avatar) toggleBatchItemLock(avatar);
+            return;
+        }
+        const nameLink = e.target.closest('.card-update-char-link[data-char-avatar]');
+        if (nameLink) {
+            const avatar = nameLink.dataset.charAvatar;
+            if (!avatar) return;
+            const allChars = CoreAPI.getAllCharacters();
+            const char = allChars.find(c => c.avatar === avatar);
+            if (char) openCharModalAbove(char);
+        }
+    });
+    batchListEl?.addEventListener('change', handleBatchCheckboxChange);
+    
+    // Filter bar clicks
+    document.getElementById('cardUpdateBatchFilterBar')?.addEventListener('click', (e) => {
+        const pill = e.target.closest('.card-update-filter-pill');
+        if (pill?.dataset.filter) applyBatchStatusFilter(pill.dataset.filter);
+    });
+    
+    // Batch select all / deselect all
+    document.getElementById('cardUpdateBatchSelectAll')?.addEventListener('click', () => setBatchItemsChecked(true));
+    document.getElementById('cardUpdateBatchDeselectAll')?.addEventListener('click', () => setBatchItemsChecked(false));
+    
+    // Pre-apply summary: clickable character names
+    document.getElementById('cardUpdateBatchSummary')?.addEventListener('click', (e) => {
+        const nameLink = e.target.closest('.card-update-char-link[data-char-avatar]');
+        if (nameLink) {
+            const avatar = nameLink.dataset.charAvatar;
+            if (!avatar) return;
+            const allChars = CoreAPI.getAllCharacters();
+            const char = allChars.find(c => c.avatar === avatar);
+            if (char) openCharModalAbove(char);
+        }
+    });
+    
+    // Pre-apply summary: toggle all / individual character checkboxes
+    document.getElementById('cardUpdateBatchSummary')?.addEventListener('change', (e) => {
+        if (e.target.id === 'batchSummaryToggleAll') {
+            const checked = e.target.checked;
+            const cbs = document.querySelectorAll('.batch-summary-char-cb');
+            cbs.forEach(cb => cb.checked = checked);
+        }
+    });
+
+    // Batch field selection
+    document.getElementById('cardUpdateBatchFieldGrid')?.addEventListener('change', handleBatchFieldSelectionChange);
+    document.getElementById('cardUpdateBatchFieldSelectAll')?.addEventListener('click', () => setBatchFieldsChecked(true));
+    document.getElementById('cardUpdateBatchFieldSelectNone')?.addEventListener('click', () => setBatchFieldsChecked(false));
+}
+
+
+// ========================================
+// MODALS HTML
+// ========================================
+
+function injectModals() {
+    if (document.getElementById('cardUpdateSingleModal')) return;
+    
+    const modalsHtml = `
+        <!-- Single Character Update Check Modal -->
+        <div id="cardUpdateSingleModal" class="cl-modal card-update-modal">
+            <div class="cl-modal-overlay"></div>
+            <div class="cl-modal-content">
+                <div class="cl-modal-header">
+                    <h3>Check for Updates: <span id="cardUpdateSingleCharName"></span></h3>
+                    <button class="cl-modal-close" id="cardUpdateSingleCloseBtn">
+                        <i class="fa-solid fa-xmark"></i>
+                    </button>
+                </div>
+                <div class="cl-modal-body">
+                    <div class="card-update-status" id="cardUpdateSingleStatus">
+                        <i class="fa-solid fa-spinner fa-spin"></i> Checking...
+                    </div>
+                    <div id="cardUpdateSingleContent"></div>
+                </div>
+                <div class="cl-modal-footer">
+                    <button class="cl-btn cl-btn-secondary" id="cardUpdateSingleCancelBtn">Cancel</button>
+                    <button class="cl-btn cl-btn-primary" id="cardUpdateSingleApplyBtn" disabled>
+                        <i class="fa-solid fa-check"></i> Apply Selected
+                    </button>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Batch Update Check Modal -->
+        <div id="cardUpdateBatchModal" class="cl-modal card-update-modal">
+            <div class="cl-modal-overlay"></div>
+            <div class="cl-modal-content">
+                <div class="cl-modal-header">
+                    <h3>Check for Card Updates <span style="white-space:nowrap">(<span id="cardUpdateBatchCount">0</span> characters)</span></h3>
+                    <button class="cl-modal-close" id="cardUpdateBatchCloseBtn">
+                        <i class="fa-solid fa-xmark"></i>
+                    </button>
+                </div>
+                <div class="cl-modal-body">
+                    <div id="cardUpdateBatchFieldSelect" class="card-update-field-select">
+                        <div class="card-update-field-header">
+                            <div class="card-update-field-title">
+                                <i class="fa-solid fa-filter"></i>
+                                <div>
+                                    <div class="card-update-field-heading">Choose fields to compare</div>
+                                    <div class="card-update-field-sub">Unselected fields will be ignored for search and sync.</div>
+                                </div>
+                            </div>
+                            <div class="card-update-field-actions">
+                                <span class="card-update-field-count" id="cardUpdateBatchFieldCount">0/0</span>
+                                <button class="cl-btn cl-btn-secondary" id="cardUpdateBatchFieldSelectAll">All</button>
+                                <button class="cl-btn cl-btn-secondary" id="cardUpdateBatchFieldSelectNone">None</button>
+                            </div>
+                        </div>
+                        <div id="cardUpdateBatchFieldGrid" class="card-update-field-grid"></div>
+                    </div>
+                    <div id="cardUpdateBatchFilterBar" class="card-update-batch-filter-bar hidden">
+                        <div class="card-update-filter-pills">
+                            <button class="card-update-filter-pill active" data-filter="all">All <span class="filter-count" id="batchFilterCountAll">0</span></button>
+                            <button class="card-update-filter-pill" data-filter="has-updates">Updates <span class="filter-count" id="batchFilterCountUpdates">0</span></button>
+                            <button class="card-update-filter-pill" data-filter="up-to-date">Up to Date <span class="filter-count" id="batchFilterCountUpToDate">0</span></button>
+                            <button class="card-update-filter-pill" data-filter="errors">Errors <span class="filter-count" id="batchFilterCountErrors">0</span></button>
+                            <button class="card-update-filter-pill" data-filter="unavailable">Unavailable <span class="filter-count" id="batchFilterCountUnavailable">0</span></button>
+                            <button class="card-update-filter-pill" data-filter="locked">Locked <span class="filter-count" id="batchFilterCountLocked">0</span></button>
+                            <button class="card-update-filter-pill" data-filter="applied">Applied <span class="filter-count" id="batchFilterCountApplied">0</span></button>
+                        </div>
+                        <div class="card-update-batch-selection-controls">
+                            <button class="card-update-select-link" id="cardUpdateBatchSelectAll">Select All</button>
+                            <span class="card-update-select-divider">|</span>
+                            <button class="card-update-select-link" id="cardUpdateBatchDeselectAll">Deselect All</button>
+                        </div>
+                    </div>
+                    <div id="cardUpdateBatchList" class="card-update-batch-list"></div>
+                    <div id="cardUpdateBatchSummary" class="card-update-batch-summary hidden"></div>
+                    <div id="cardUpdateBatchProgress" class="card-update-batch-progress"></div>
+                </div>
+                <div class="cl-modal-footer">
+                    <div id="cardUpdateBatchApplyProgress" class="card-update-apply-progress" style="display: none;">
+                        <div class="card-update-apply-text" id="cardUpdateBatchApplyText">Applying updates...</div>
+                        <div class="card-update-apply-bar">
+                            <div class="card-update-apply-fill" id="cardUpdateBatchApplyFill"></div>
+                        </div>
+                    </div>
+                    <div id="cardUpdateBatchActions" class="card-update-batch-actions" style="display: none;">
+                        <button class="cl-btn cl-btn-primary" id="cardUpdateBatchApplyAllBtn">
+                            <i class="fa-solid fa-clipboard-check"></i> Apply All Selected (0)
+                        </button>
+                    </div>
+                    <button class="cl-btn cl-btn-primary" id="cardUpdateBatchStartBtn">
+                        <i class="fa-solid fa-magnifying-glass"></i> Start Check
+                    </button>
+                    <button class="cl-btn cl-btn-warning card-update-pause-btn" id="cardUpdateBatchPauseBtn" style="display: none;">
+                        <i class="fa-solid fa-pause"></i> Pause
+                    </button>
+                    <button class="cl-btn cl-btn-secondary" id="cardUpdateBatchSummaryBackBtn" style="display: none;">
+                        <i class="fa-solid fa-arrow-left"></i> Back
+                    </button>
+                    <button class="cl-btn cl-btn-primary" id="cardUpdateBatchSummaryConfirmBtn" style="display: none;">
+                        <i class="fa-solid fa-check-double"></i> Confirm & Apply
+                    </button>
+                    <button class="cl-btn cl-btn-secondary" id="cardUpdateBatchCloseFooterBtn">Close</button>
+                </div>
+            </div>
+        </div>
+    `;
+    
+    document.body.insertAdjacentHTML('beforeend', modalsHtml);
+}
+
+// ========================================
+// EXPORTS
+// ========================================
+
+export default {
+    init,
+    checkSingleCharacter,
+    checkAllLinkedCharacters,
+    checkSelectedCharacters
+};

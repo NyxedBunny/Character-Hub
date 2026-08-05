@@ -1,0 +1,2056 @@
+// Character version history - local snapshots + remote provider versions
+
+import * as CoreAPI from './core-api.js';
+
+// ========================================
+// MODULE STATE
+// ========================================
+
+let isInitialized = false;
+
+// Remote version caches
+const versionListCache = new Map(); // cacheKey -> { versions, fetchedAt }
+const VERSION_LIST_CACHE_TTL = 5 * 60 * 1000;
+const versionDataCache = new Map(); // cacheKey:ref -> cardData
+const VERSION_DATA_CACHE_MAX = 20;
+
+// Active pane state
+let paneContainer = null;
+let currentChar = null;
+let currentProvider = null; // ProviderBase instance for the active character
+let currentLinkInfo = null; // ProviderLinkInfo for the active character
+let currentVersions = [];
+let selectedVersionRef = null;
+let activeTab = 'remote';
+let currentLocalSnapshots = [];
+let selectedSnapshotId = null;
+let paneDelegationHandler = null;
+let _dialogOpen = false; // re-entry guard for dialogs
+let _renderGen = 0;
+
+// ========================================
+// FILESYSTEM STORAGE VIA ST FILES API
+// ========================================
+
+const FILE_PREFIX = '_clv_';
+const INDEX_FILE = `${FILE_PREFIX}index.json`;
+
+// In-memory cache (loaded once on first access)
+let cachedIndex = null;
+let charDataCache = new Map(); // version_uid -> char file data
+
+// Fields captured in snapshots / restores
+const CARD_FIELDS = [
+    'name', 'description', 'personality', 'scenario',
+    'first_mes', 'mes_example', 'system_prompt',
+    'post_history_instructions', 'creator_notes', 'creator',
+    // 'character_version', // Always "main" on ChubAI - excluded from diffs
+    'tags', 'alternate_greetings', 'nickname', 'character_book'
+];
+
+// --- Low-level File I/O ---
+
+async function fileUpload(name, data) {
+    const jsonStr = JSON.stringify(data);
+    const base64 = CoreAPI.utf8ToBase64(jsonStr);
+    const resp = await CoreAPI.apiRequest('/files/upload', 'POST', { name, data: base64 });
+    if (!resp.ok) {
+        const err = await resp.text().catch(() => resp.statusText);
+        throw new Error(`File upload failed (${resp.status}): ${err}`);
+    }
+    return resp.json();
+}
+
+async function fileRead(name) {
+    try {
+        const resp = await fetch(`/user/files/${name}`);
+        if (!resp.ok) return null;
+        const text = await resp.text();
+        if (!text || !text.trim()) return null;
+        return JSON.parse(text);
+    } catch (e) {
+        console.warn(`[CharVersions] fileRead(${name}):`, e.message);
+        return null;
+    }
+}
+
+async function fileDelete(name) {
+    try {
+        const resp = await CoreAPI.apiRequest('/files/delete', 'POST', { path: `user/files/${name}` });
+        return resp.ok;
+    } catch (e) {
+        console.warn(`[CharVersions] fileDelete(${name}):`, e.message);
+        return false;
+    }
+}
+
+// --- Index Management ---
+
+function createEmptyIndex() {
+    return { version: 1, characters: {}, avatarMap: {} };
+}
+
+async function ensureIndexLoaded() {
+    if (cachedIndex) return cachedIndex;
+    cachedIndex = await fileRead(INDEX_FILE);
+    if (!cachedIndex || typeof cachedIndex !== 'object' || !cachedIndex.characters) {
+        cachedIndex = createEmptyIndex();
+    }
+    return cachedIndex;
+}
+
+async function saveIndex() {
+    if (!cachedIndex) return;
+    await fileUpload(INDEX_FILE, cachedIndex);
+}
+
+async function updateIndex(versionUid, name, avatar, snapshotCount) {
+    await ensureIndexLoaded();
+    cachedIndex.characters[versionUid] = {
+        name,
+        avatar,
+        snapshotCount,
+        lastModified: Date.now()
+    };
+    // Update avatar map (remove old mappings to this uid, add current)
+    for (const [av, uid] of Object.entries(cachedIndex.avatarMap)) {
+        if (uid === versionUid && av !== avatar) delete cachedIndex.avatarMap[av];
+    }
+    cachedIndex.avatarMap[avatar] = versionUid;
+    await saveIndex();
+}
+
+async function removeFromIndex(versionUid) {
+    await ensureIndexLoaded();
+    delete cachedIndex.characters[versionUid];
+    for (const [av, uid] of Object.entries(cachedIndex.avatarMap)) {
+        if (uid === versionUid) delete cachedIndex.avatarMap[av];
+    }
+    await saveIndex();
+}
+
+async function lookupUidByAvatar(avatar) {
+    await ensureIndexLoaded();
+    return cachedIndex.avatarMap[avatar] || null;
+}
+
+// --- Character File Management ---
+
+function charFileName(versionUid) {
+    return `${FILE_PREFIX}${versionUid}.json`;
+}
+
+function createEmptyCharFile(versionUid, name, avatar) {
+    return {
+        version_uid: versionUid,
+        name,
+        avatar,
+        nextId: 1,
+        snapshots: [],
+        backup: null
+    };
+}
+
+async function loadCharFile(versionUid) {
+    if (charDataCache.has(versionUid)) return charDataCache.get(versionUid);
+    const data = await fileRead(charFileName(versionUid));
+    if (data) charDataCache.set(versionUid, data);
+    return data;
+}
+
+async function saveCharFile(versionUid, charFile) {
+    charDataCache.set(versionUid, charFile);
+    await fileUpload(charFileName(versionUid), charFile);
+    await updateIndex(versionUid, charFile.name, charFile.avatar, charFile.snapshots.length);
+}
+
+// --- Storage API ---
+
+// Deduplicates auto_backup snapshots and caps to configured max (default 10)
+async function storageSaveSnapshot(avatar, charName, label, source, data, versionUid) {
+    if (!versionUid) throw new Error('version_uid required');
+    let charFile = await loadCharFile(versionUid);
+    if (!charFile) charFile = createEmptyCharFile(versionUid, charName, avatar);
+
+    // Update metadata
+    charFile.name = charName;
+    charFile.avatar = avatar;
+
+    const dataCopy = JSON.parse(JSON.stringify(data));
+
+    // Dedup: skip if the latest auto_backup for this character is identical
+    if (source === 'auto_backup') {
+        const existing = charFile.snapshots.filter(s => s.source === 'auto_backup');
+        if (existing.length > 0) {
+            const latest = existing[existing.length - 1];
+            if (JSON.stringify(latest.data) === JSON.stringify(dataCopy)) {
+                CoreAPI.debugLog('[CharVersions] Skipping duplicate auto-backup snapshot');
+                return latest.id;
+            }
+        }
+    }
+
+    const id = charFile.nextId++;
+    charFile.snapshots.push({
+        id,
+        label,
+        source,
+        timestamp: Date.now(),
+        charName,
+        data: dataCopy
+    });
+
+    // Cap: prune oldest auto_backup snapshots beyond max
+    if (source === 'auto_backup') {
+        const maxBackups = CoreAPI.getSetting('maxAutoBackups') ?? 10;
+        if (maxBackups > 0) {
+            const autoBackups = charFile.snapshots.filter(s => s.source === 'auto_backup');
+            if (autoBackups.length > maxBackups) {
+                const toRemove = autoBackups.slice(0, autoBackups.length - maxBackups);
+                const removeIds = new Set(toRemove.map(s => s.id));
+                charFile.snapshots = charFile.snapshots.filter(s => !removeIds.has(s.id));
+            }
+        }
+    }
+
+    await saveCharFile(versionUid, charFile);
+    return id;
+}
+
+async function storageGetSnapshots(avatar, versionUid) {
+    let uid = versionUid;
+    if (!uid) uid = await lookupUidByAvatar(avatar);
+    if (!uid) return [];
+
+    const charFile = await loadCharFile(uid);
+    if (!charFile || !charFile.snapshots) return [];
+
+    // Return sorted by timestamp descending (newest first)
+    return [...charFile.snapshots].sort((a, b) => b.timestamp - a.timestamp);
+}
+
+async function storageGetSnapshot(versionUid, snapshotId) {
+    if (!versionUid) return null;
+    const charFile = await loadCharFile(versionUid);
+    if (!charFile) return null;
+    return charFile.snapshots.find(s => s.id === snapshotId) || null;
+}
+
+async function storageDeleteSnapshot(versionUid, snapshotId) {
+    if (!versionUid) return;
+    const charFile = await loadCharFile(versionUid);
+    if (!charFile) return;
+    charFile.snapshots = charFile.snapshots.filter(s => s.id !== snapshotId);
+
+    if (charFile.snapshots.length === 0 && !charFile.backup) {
+        // No data left - remove the file entirely
+        charDataCache.delete(versionUid);
+        await fileDelete(charFileName(versionUid));
+        await removeFromIndex(versionUid);
+    } else {
+        await saveCharFile(versionUid, charFile);
+    }
+}
+
+async function storageRenameSnapshot(versionUid, snapshotId, newLabel) {
+    if (!versionUid) return;
+    const charFile = await loadCharFile(versionUid);
+    if (!charFile) return;
+    const snap = charFile.snapshots.find(s => s.id === snapshotId);
+    if (!snap) throw new Error('Snapshot not found');
+    snap.label = newLabel;
+    await saveCharFile(versionUid, charFile);
+}
+
+async function storageSaveBackup(avatar, versionUid, data) {
+    if (!versionUid) return;
+    let charFile = await loadCharFile(versionUid);
+    if (!charFile) charFile = createEmptyCharFile(versionUid, '', avatar);
+    charFile.avatar = avatar;
+    charFile.backup = {
+        timestamp: Date.now(),
+        data: JSON.parse(JSON.stringify(data))
+    };
+    await saveCharFile(versionUid, charFile);
+}
+
+async function storageGetBackup(versionUid) {
+    if (!versionUid) return null;
+    const charFile = await loadCharFile(versionUid);
+    return charFile?.backup || null;
+}
+
+async function storageClearBackup(versionUid) {
+    if (!versionUid) return;
+    const charFile = await loadCharFile(versionUid);
+    if (!charFile) return;
+    charFile.backup = null;
+
+    if (charFile.snapshots.length === 0) {
+        charDataCache.delete(versionUid);
+        await fileDelete(charFileName(versionUid));
+        await removeFromIndex(versionUid);
+    } else {
+        await saveCharFile(versionUid, charFile);
+    }
+}
+
+// ========================================
+// ========================================
+
+function generateVersionUid() {
+    const c = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    let r = '';
+    for (let i = 0; i < 16; i++) r += c.charAt(Math.floor(Math.random() * c.length));
+    return r;
+}
+
+function getVersionUid(char) {
+    return char?.data?.extensions?.version_uid || null;
+}
+
+async function ensureVersionUid(char) {
+    let uid = getVersionUid(char);
+    if (uid) return uid;
+
+    uid = generateVersionUid();
+    const success = await CoreAPI.applyCardFieldUpdates(char.avatar, {
+        'extensions.version_uid': uid
+    });
+
+    if (success) {
+        // Update local reference too
+        if (!char.data) char.data = {};
+        if (!char.data.extensions) char.data.extensions = {};
+        char.data.extensions.version_uid = uid;
+        CoreAPI.debugLog(`[CharVersions] Assigned version_uid ${uid} to ${char.name || char.avatar}`);
+    } else {
+        console.warn('[CharVersions] Failed to persist version_uid — using ephemeral');
+    }
+    return uid;
+}
+
+// ========================================
+// CARD DATA EXTRACTION
+// ========================================
+
+async function extractCardData(char, opts = {}) {
+    if (char._slim) await CoreAPI.hydrateCharacter(char);
+    const src = char.data || char;
+    const out = JSON.parse(JSON.stringify(src));
+    // Preserve avatar URL for snapshot comparisons
+    if (char.avatar) {
+        out._avatarUrl = `/characters/${encodeURIComponent(char.avatar)}`;
+    }
+    // Optionally embed the live avatar PNG as a base64 data URL so the snapshot
+    // remains visually accurate even after the character's PNG is overwritten.
+    if (opts.embedAvatar && char.avatar) {
+        try {
+            const resp = await fetch(`/characters/${encodeURIComponent(char.avatar)}`);
+            if (resp.ok) {
+                const blob = await resp.blob();
+                const dataUrl = await new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = () => resolve(reader.result);
+                    reader.onerror = () => reject(reader.error);
+                    reader.readAsDataURL(blob);
+                });
+                out._avatarImageData = dataUrl;
+            }
+        } catch (e) {
+            CoreAPI.debugLog('[CharVersions] Failed to embed avatar image:', e);
+        }
+    }
+    return out;
+}
+
+// ========================================
+// INITIALIZATION
+// ========================================
+
+export function init(deps) {
+    if (isInitialized) return;
+    // Lazy-load index in background (non-blocking)
+    ensureIndexLoaded()
+        .catch(e => console.error('[CharVersions] Init error:', e));
+    // confirm/input dialogs share one id (mutually exclusive via _dialogOpen); the registry close
+    // routes through _closeFn so Escape / Android back resolve the promise as cancel, not a bare remove.
+    window.registerOverlay?.({ id: 'vtDialog', tier: 5, static: false, close: (el) => el?._closeFn ? el._closeFn() : el?.remove() });
+    isInitialized = true;
+    CoreAPI.debugLog('[CharVersions] Module initialized (v4 — filesystem storage)');
+}
+
+// ========================================
+// PUBLIC API
+// ========================================
+
+export async function openVersionHistory(char) {
+    if (!char) return;
+    await CoreAPI.openCharacterModal(char);
+    const btn = document.querySelector('.tab-btn[data-tab="versions"]');
+    if (btn) btn.click();
+}
+
+export function renderVersionsPane(container, char) {
+    if (!container || !char) return;
+
+    _renderGen++;
+    paneContainer = container;
+    currentChar = char;
+
+    const match = CoreAPI.getCharacterProvider(char);
+    currentProvider = match?.provider?.supportsVersionHistory ? match.provider : null;
+    currentLinkInfo = match?.linkInfo || null;
+
+    currentVersions = [];
+    selectedVersionRef = null;
+    currentLocalSnapshots = [];
+    selectedSnapshotId = null;
+    activeTab = currentProvider ? 'remote' : 'local';
+
+    container.innerHTML = buildPaneHtml();
+    setupPaneDelegation(container);
+
+    if (activeTab === 'remote') {
+        loadRemoteVersions();
+    } else {
+        loadLocalSnapshots();
+    }
+}
+
+export function cleanupVersionsPane() {
+    _renderGen++;
+    if (paneContainer && paneDelegationHandler) {
+        paneContainer.removeEventListener('click', paneDelegationHandler);
+    }
+    currentChar = null;
+    currentProvider = null;
+    currentLinkInfo = null;
+    currentVersions = [];
+    selectedVersionRef = null;
+    currentLocalSnapshots = [];
+    selectedSnapshotId = null;
+    paneContainer = null;
+    paneDelegationHandler = null;
+}
+
+export async function saveCurrentSnapshot(char, label = '') {
+    const uid = await ensureVersionUid(char);
+    const data = await extractCardData(char);
+    const charName = char.data?.name || char.name || 'Unknown';
+    const finalLabel = label || `Snapshot ${new Date().toLocaleString()}`;
+    await storageSaveSnapshot(char.avatar, charName, finalLabel, 'local', data, uid);
+    CoreAPI.hapticFeedback(12);
+    CoreAPI.showToast(`Snapshot saved: "${finalLabel}"`, 'success');
+}
+
+export async function autoSnapshotBeforeChange(char, source = 'edit', opts = {}) {
+    if (!char) return;
+    const enabled = CoreAPI.getSetting('autoSnapshotOnEdit');
+    if (!enabled) return;
+    try {
+        const uid = await ensureVersionUid(char);
+        const data = await extractCardData(char, opts);
+        const charName = char.data?.name || char.name || 'Unknown';
+        const timestamp = new Date().toLocaleString();
+        const label = `${source.charAt(0).toUpperCase() + source.slice(1)} - ${timestamp}`;
+        await storageSaveSnapshot(char.avatar, charName, label, 'auto_backup', data, uid);
+    } catch (e) {
+        console.error('[CharVersions] Auto-snapshot failed:', e);
+    }
+}
+
+// ========================================
+// SCOPED DOM HELPERS
+// ========================================
+
+function el(sel) { return paneContainer?.querySelector(sel); }
+
+// ========================================
+// PANE HTML
+// ========================================
+
+function buildPaneHtml() {
+    const hasRemote = !!currentProvider;
+    return `
+        <div class="vt-container">
+            <button class="vt-btn vt-back-btn"><i class="fa-solid fa-arrow-left"></i> Back to list</button>
+            <div class="vt-toolbar">
+                ${hasRemote ? `
+                <div class="vt-sub-tabs">
+                    <button class="vt-sub-tab ${activeTab === 'remote' ? 'active' : ''}" data-vt-tab="remote">
+                        <i class="fa-solid fa-cloud"></i> Remote
+                    </button>
+                    <button class="vt-sub-tab ${activeTab === 'local' ? 'active' : ''}" data-vt-tab="local">
+                        <i class="fa-solid fa-bookmark"></i> Local
+                    </button>
+                </div>` : `
+                <div class="vt-sub-tabs">
+                    <span class="vt-sub-tab active" style="cursor:default;">
+                        <i class="fa-solid fa-bookmark"></i> Local Snapshots
+                    </span>
+                </div>`}
+                <div class="vt-toolbar-right">
+                    <button class="vt-btn vt-save-snapshot" title="Save current card state as a snapshot">
+                        <i class="fa-solid fa-camera"></i> Save Snapshot
+                    </button>
+                    <button class="vt-btn vt-refresh" title="Refresh">
+                        <i class="fa-solid fa-arrows-rotate"></i>
+                    </button>
+                </div>
+            </div>
+            <div class="vt-status">
+                <i class="fa-solid fa-spinner fa-spin"></i> Loading...
+            </div>
+            <div class="vt-body">
+                <div class="vt-list"></div>
+                <div class="vt-preview vt-hidden"></div>
+            </div>
+            <div class="vt-actions vt-hidden">
+                <div class="vt-actions-left">
+                    <button class="vt-btn vt-rename" title="Rename snapshot"><i class="fa-solid fa-pen"></i></button>
+                    <button class="vt-btn vt-delete" title="Delete snapshot"><i class="fa-solid fa-trash-can"></i></button>
+                </div>
+                <div class="vt-actions-right">
+                    <button class="vt-btn vt-undo" title="Undo last restore"><i class="fa-solid fa-rotate-left"></i> Undo</button>
+                    <button class="vt-btn vt-restore" title="Restore this version"><i class="fa-solid fa-download"></i> Restore</button>
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+// ========================================
+// EVENT DELEGATION
+// ========================================
+
+function setupPaneDelegation(container) {
+    // Remove previous handler to prevent accumulation on re-renders
+    if (paneDelegationHandler) {
+        container.removeEventListener('click', paneDelegationHandler);
+    }
+
+    paneDelegationHandler = (e) => {
+        if (e.target.closest('.vt-back-btn')) { closeMobileDetail(); return; }
+
+        const tab = e.target.closest('[data-vt-tab]');
+        if (tab) { switchTab(tab.dataset.vtTab); return; }
+
+        // Remote version selection (including provider page pseudo-entry)
+        const vItem = e.target.closest('.vt-item[data-ref]');
+        if (vItem) {
+            if (vItem.dataset.ref === '__provider_page__') { selectProviderPageVersion(); return; }
+            selectVersion(vItem.dataset.ref, vItem.dataset.fullId); return;
+        }
+
+        // Local snapshot selection
+        const sItem = e.target.closest('.vt-item[data-snapshot-id]');
+        if (sItem) { selectSnapshot(Number(sItem.dataset.snapshotId)); return; }
+
+        // Lorebook sub-section expand/collapse
+        const lbSh = e.target.closest('.vt-lb-section-header');
+        if (lbSh) { lbSh.parentElement.classList.toggle('expanded'); return; }
+
+        // Greeting block expand/collapse (check first so it doesn't bubble to outer diff header)
+        const gh = e.target.closest('.vt-greeting-header');
+        if (gh) { gh.parentElement.classList.toggle('expanded'); return; }
+
+        // Diff expand/collapse
+        const dh = e.target.closest('.vt-diff-header');
+        if (dh) { dh.parentElement.classList.toggle('expanded'); return; }
+
+        // Buttons (guard against re-entry while a dialog is open)
+        if (_dialogOpen) return;
+        if (e.target.closest('.vt-save-snapshot')) { handleSaveSnapshot(); return; }
+        if (e.target.closest('.vt-refresh')) { handleRefresh(); return; }
+        if (e.target.closest('.vt-restore')) { restoreVersion(); return; }
+        if (e.target.closest('.vt-undo')) { undoRestore(); return; }
+        if (e.target.closest('.vt-rename')) { handleRenameSnapshot(); return; }
+        if (e.target.closest('.vt-delete')) { handleDeleteSnapshot(); return; }
+
+        // Apply avatar button
+        const applyAvBtn = e.target.closest('.vt-apply-avatar');
+        if (applyAvBtn) { handleApplyAvatar(applyAvBtn.dataset.avatarUrl); return; }
+    };
+
+    container.addEventListener('click', paneDelegationHandler);
+}
+
+// ========================================
+// TAB SWITCHING
+// ========================================
+
+async function switchTab(tab) {
+    if (tab === activeTab) return;
+    activeTab = tab;
+
+    // Update sub-tab buttons
+    paneContainer.querySelectorAll('.vt-sub-tab').forEach(t => {
+        t.classList.toggle('active', t.dataset.vtTab === tab);
+    });
+
+    // Reset selection
+    selectedVersionRef = null;
+    selectedSnapshotId = null;
+    const preview = el('.vt-preview');
+    if (preview) { preview.innerHTML = ''; preview.classList.add('vt-hidden'); }
+    const actions = el('.vt-actions');
+    if (actions) actions.classList.add('vt-hidden');
+    el('.vt-container')?.classList.remove('vt-detail-open');
+
+    if (tab === 'remote' && currentProvider) {
+        await loadRemoteVersions();
+    } else if (tab === 'local') {
+        await loadLocalSnapshots();
+    }
+}
+
+function closeMobileDetail() {
+    el('.vt-container')?.classList.remove('vt-detail-open');
+}
+
+function handleRefresh() {
+    if (activeTab === 'remote' && currentProvider) {
+        const cacheKey = `${currentProvider.id}:${currentLinkInfo?.fullPath}`;
+        versionListCache.delete(cacheKey);
+        loadRemoteVersions();
+    } else if (activeTab === 'local') {
+        loadLocalSnapshots();
+    }
+}
+
+// ========================================
+// REMOTE VERSIONS
+// ========================================
+
+async function loadRemoteVersions() {
+    const gen = _renderGen;
+    const status = el('.vt-status');
+    const list = el('.vt-list');
+    if (!status || !list || !currentProvider || !currentLinkInfo) return;
+
+    const cacheKey = `${currentProvider.id}:${currentLinkInfo.fullPath}`;
+
+    try {
+        const cached = versionListCache.get(cacheKey);
+        if (cached && Date.now() - cached.fetchedAt < VERSION_LIST_CACHE_TTL) {
+            currentVersions = cached.versions;
+            renderRemoteList(cached.versions);
+            return;
+        }
+
+        status.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Fetching version history...';
+        list.innerHTML = '';
+
+        const versions = await currentProvider.fetchVersionList(currentLinkInfo);
+        if (gen !== _renderGen) return;
+
+        if (!versions.length) {
+            status.innerHTML = '<i class="fa-solid fa-info-circle"></i> No version history found';
+            return;
+        }
+
+        currentVersions = versions;
+        versionListCache.set(cacheKey, { versions, fetchedAt: Date.now() });
+        renderRemoteList(versions);
+    } catch (e) {
+        if (gen !== _renderGen) return;
+        console.error('[CharVersions] loadRemoteVersions:', e);
+        status.innerHTML = `<i class="fa-solid fa-xmark"></i> Error: ${esc(e.message)}`;
+    }
+}
+
+function renderRemoteList(versions) {
+    const status = el('.vt-status');
+    const list = el('.vt-list');
+    status.innerHTML = `<i class="fa-solid fa-clock-rotate-left"></i> ${versions.length} version${versions.length !== 1 ? 's' : ''} found`;
+
+    // Provider "page" entry - shows what the provider's metadata API returns,
+    // which can differ from the Git-exported card.json that versions are based on.
+    const showPageEntry = currentProvider?.supportsRemotePageVersion;
+    const pageInfo = showPageEntry ? currentProvider.getRemotePageInfo() : null;
+    const pageDate = pageInfo?.date ? new Date(pageInfo.date) : null;
+    const pageDateValid = pageDate && !isNaN(pageDate.getTime());
+    const pageLabel = currentProvider?.remoteVersionLabel || 'Provider Page';
+
+    function buildPageEntry() {
+        if (!showPageEntry) return '';
+        const dateHtml = pageDateValid
+            ? `<i class="fa-regular fa-clock"></i> <span title="${esc(pageDate.toLocaleString())}">Last activity ${relTime(pageDate)}</span>`
+            : `<i class="fa-solid fa-globe"></i> <span>Metadata API</span>`;
+        return `
+            <div class="vt-item provider-page" data-ref="__provider_page__">
+                <div class="vt-item-header">
+                    <span class="vt-item-id">${esc(pageLabel)}</span>
+                    <span class="vt-badge provider-page">API</span>
+                </div>
+                <div class="vt-item-title">Current published state from ${esc(currentProvider.name)}</div>
+                <div class="vt-item-date">${dateHtml}</div>
+            </div>`;
+    }
+
+    // Insert the page entry in chronological order among versions.
+    let insertIdx = 0;
+    if (pageDateValid && showPageEntry) {
+        for (let i = 0; i < versions.length; i++) {
+            const vDate = new Date(versions[i].date);
+            if (pageDate >= vDate) { insertIdx = i; break; }
+            insertIdx = i + 1;
+        }
+    }
+
+    const versionItems = versions.map((v, idx) => {
+        const date = new Date(v.date);
+        const vid = v.ref?.substring(0, 8) || v.ref;
+        const title = v.message || 'Update';
+        const isLatest = idx === 0;
+        return `
+            <div class="vt-item ${isLatest ? 'latest' : ''}" data-ref="${esc(vid)}" data-full-id="${esc(v.ref)}">
+                <div class="vt-item-header">
+                    <span class="vt-item-id">${esc(vid)}</span>
+                    ${isLatest ? '<span class="vt-badge latest">Latest</span>' : ''}
+                </div>
+                <div class="vt-item-title">${esc(CoreAPI.truncate(title, 55))}</div>
+                <div class="vt-item-date">
+                    <i class="fa-regular fa-clock"></i>
+                    <span title="${esc(date.toLocaleString())}">${relTime(date)}</span>
+                </div>
+            </div>`;
+    }).join('');
+
+    list.innerHTML = versionItems;
+
+    // Splice the page entry into its chronological position
+    const pageEntry = buildPageEntry();
+    if (pageEntry) {
+        const items = list.querySelectorAll('.vt-item');
+        if (insertIdx >= items.length) {
+            list.insertAdjacentHTML('beforeend', pageEntry);
+        } else {
+            items[insertIdx].insertAdjacentHTML('beforebegin', pageEntry);
+        }
+    }
+}
+
+// ========================================
+// LOCAL SNAPSHOTS
+// ========================================
+
+async function loadLocalSnapshots() {
+    const gen = _renderGen;
+    const status = el('.vt-status');
+    const list = el('.vt-list');
+    const preview = el('.vt-preview');
+    const actions = el('.vt-actions');
+    if (!status || !list) return;
+
+    status.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Loading snapshots...';
+    list.innerHTML = '';
+    if (preview) { preview.innerHTML = ''; preview.classList.add('vt-hidden'); }
+    if (actions) actions.classList.add('vt-hidden');
+
+    try {
+        const uid = getVersionUid(currentChar);
+        const snaps = await storageGetSnapshots(currentChar.avatar, uid);
+        if (gen !== _renderGen) return;
+        currentLocalSnapshots = snaps;
+        selectedSnapshotId = null;
+
+        if (!snaps.length) {
+            status.innerHTML = '<i class="fa-solid fa-info-circle"></i><span>No snapshots yet — click <b>Save Snapshot</b> to create one</span>';
+            return;
+        }
+        status.innerHTML = `<i class="fa-solid fa-bookmark"></i> ${snaps.length} snapshot${snaps.length !== 1 ? 's' : ''}`;
+        renderSnapshotList(snaps);
+    } catch (e) {
+        if (gen !== _renderGen) return;
+        console.error('[CharVersions] loadLocalSnapshots:', e);
+        status.innerHTML = '<i class="fa-solid fa-xmark"></i> Error loading snapshots';
+    }
+}
+
+function renderSnapshotList(snaps) {
+    const list = el('.vt-list');
+    list.innerHTML = snaps.map(s => {
+        const date = new Date(s.timestamp);
+        let icon;
+        switch (s.source) {
+            case 'chub_restore':  // legacy
+            case 'remote_restore': icon = 'fa-cloud-arrow-down'; break;
+            case 'auto_backup': icon = 'fa-shield-halved'; break;
+            default: icon = 'fa-bookmark';
+        }
+        return `
+            <div class="vt-item" data-snapshot-id="${s.id}">
+                <div class="vt-item-header">
+                    <i class="fa-solid ${icon} vt-item-icon"></i>
+                    <span class="vt-item-label">${esc(CoreAPI.truncate(s.label, 40))}</span>
+                </div>
+                <div class="vt-item-date">
+                    <i class="fa-regular fa-clock"></i>
+                    <span title="${esc(date.toLocaleString())}">${relTime(date)}</span>
+                </div>
+            </div>`;
+    }).join('');
+}
+
+// ========================================
+// SELECTION HANDLERS
+// ========================================
+
+async function selectVersion(shortId, fullId) {
+    if (!currentProvider) return;
+    const gen = _renderGen;
+    selectedVersionRef = shortId;
+    selectedSnapshotId = null;
+
+    paneContainer.querySelectorAll('.vt-item').forEach(i =>
+        i.classList.toggle('selected', i.dataset.ref === shortId)
+    );
+
+    updateActionsVisibility();
+    el('.vt-container')?.classList.add('vt-detail-open');
+
+    const preview = el('.vt-preview');
+    preview.classList.remove('vt-hidden');
+    preview.innerHTML = '<div class="vt-loading"><i class="fa-solid fa-spinner fa-spin"></i> Loading version data...</div>';
+
+    const ref = fullId || shortId;
+    const cacheKey = `${currentProvider.id}:${ref}`;
+
+    try {
+        let card;
+        if (versionDataCache.has(cacheKey)) {
+            card = versionDataCache.get(cacheKey);
+        } else {
+            card = await currentProvider.fetchVersionData(currentLinkInfo, ref);
+            if (gen !== _renderGen) return;
+            if (card) {
+                if (versionDataCache.size >= VERSION_DATA_CACHE_MAX)
+                    versionDataCache.delete(versionDataCache.keys().next().value);
+                versionDataCache.set(cacheKey, card);
+            }
+        }
+        if (!card) { preview.innerHTML = '<div class="vt-error"><i class="fa-solid fa-exclamation-triangle"></i> Could not load version data</div>'; return; }
+        renderDiffPreview(preview, currentChar?.data || currentChar, card);
+        resolveVersionWorldFileStatus(preview, currentChar?.avatar).catch(() => {});
+    } catch (e) {
+        preview.innerHTML = '<div class="vt-error"><i class="fa-solid fa-xmark"></i> Error loading preview</div>';
+    }
+}
+
+/**
+ * Handle selection of the provider page pseudo-version entry.
+ * Shows a diff against the provider's metadata API response - what the
+ * provider website displays, which may differ from the Git-exported card.json.
+ */
+async function selectProviderPageVersion() {
+    if (!currentProvider?.supportsRemotePageVersion) return;
+    const gen = _renderGen;
+    selectedVersionRef = '__provider_page__';
+    selectedSnapshotId = null;
+
+    paneContainer.querySelectorAll('.vt-item').forEach(i =>
+        i.classList.toggle('selected', i.dataset.ref === '__provider_page__')
+    );
+
+    updateActionsVisibility();
+    el('.vt-container')?.classList.add('vt-detail-open');
+
+    const preview = el('.vt-preview');
+    preview.classList.remove('vt-hidden');
+    const provName = currentProvider.name;
+    preview.innerHTML = `<div class="vt-loading"><i class="fa-solid fa-spinner fa-spin"></i> Loading ${esc(provName)} page data...</div>`;
+
+    try {
+        const card = await currentProvider.fetchRemotePageCard(currentLinkInfo);
+        if (gen !== _renderGen) return;
+        if (!card) { preview.innerHTML = '<div class="vt-error"><i class="fa-solid fa-xmark"></i> Could not load page data</div>'; return; }
+        renderDiffPreview(preview, currentChar?.data || currentChar, card);
+
+        // Info banner about what this entry represents
+        const pageInfo = currentProvider.getRemotePageInfo();
+        const banner = document.createElement('div');
+        banner.className = 'vt-page-version-banner';
+        let bannerText;
+        if (card._linkedLorebook) {
+            bannerText = `Character fields come from the ${esc(provName)} <strong>metadata API</strong>. The lorebook is a <strong>linked lorebook</strong> (separate project) resolved via a secondary API — the metadata API only stores ${card._metaLorebookEntries ?? 0} embedded entr${(card._metaLorebookEntries ?? 0) === 1 ? 'y' : 'ies'}.`;
+        } else {
+            bannerText = pageInfo?.description || `Shows the current state from the ${esc(provName)} metadata API.`;
+        }
+        banner.innerHTML = `<i class="fa-solid fa-globe"></i><span>${bannerText}</span>`;
+        const header = preview.querySelector('.vt-preview-header');
+        if (header) header.after(banner);
+
+        resolveVersionWorldFileStatus(preview, currentChar?.avatar).catch(() => {});
+    } catch (e) {
+        preview.innerHTML = `<div class="vt-error"><i class="fa-solid fa-xmark"></i> Error loading ${esc(provName)} page data</div>`;
+    }
+}
+
+async function selectSnapshot(id) {
+    const gen = _renderGen;
+    selectedSnapshotId = id;
+    selectedVersionRef = null;
+
+    paneContainer.querySelectorAll('.vt-item').forEach(i =>
+        i.classList.toggle('selected', String(i.dataset.snapshotId) === String(id))
+    );
+
+    updateActionsVisibility();
+    el('.vt-container')?.classList.add('vt-detail-open');
+
+    const preview = el('.vt-preview');
+    preview.classList.remove('vt-hidden');
+    preview.innerHTML = '<div class="vt-loading"><i class="fa-solid fa-spinner fa-spin"></i> Loading snapshot...</div>';
+
+    try {
+        const uid = getVersionUid(currentChar) || await lookupUidByAvatar(currentChar.avatar);
+        if (gen !== _renderGen) return;
+        const snap = uid ? await storageGetSnapshot(uid, id) : null;
+        if (gen !== _renderGen) return;
+        if (!snap) { preview.innerHTML = '<div class="vt-error"><i class="fa-solid fa-exclamation-triangle"></i> Snapshot not found</div>'; return; }
+        renderDiffPreview(preview, currentChar?.data || currentChar, snap.data);
+        resolveVersionWorldFileStatus(preview, currentChar?.avatar).catch(() => {});
+    } catch {
+        preview.innerHTML = '<div class="vt-error"><i class="fa-solid fa-xmark"></i> Error loading snapshot</div>';
+    }
+}
+
+function updateActionsVisibility() {
+    const actions = el('.vt-actions');
+    if (!actions) return;
+
+    const hasSelection = selectedVersionRef || selectedSnapshotId;
+    actions.classList.toggle('vt-hidden', !hasSelection);
+
+    // Show rename/delete only for local snapshots
+    const rename = actions.querySelector('.vt-rename');
+    const del = actions.querySelector('.vt-delete');
+    if (rename) rename.style.display = activeTab === 'local' && selectedSnapshotId ? '' : 'none';
+    if (del) del.style.display = activeTab === 'local' && selectedSnapshotId ? '' : 'none';
+}
+
+// ========================================
+// DIFF PREVIEW
+// ========================================
+
+// Namespace-level diff/restore allowlist: registered provider ids + 'cl'. Flat keys and orphan namespaces are out; they stay sticky via the spread merge in applyCardFieldUpdates.
+function getKnownProviderNamespaces() {
+    const ids = CoreAPI.getAllProviders().map(p => p.id);
+    return new Set([...ids, 'cl']);
+}
+
+// Bring targetExt's allowlisted namespaces into the live card; sentinel-delete any leaf/namespace present locally but absent in target. Skips empty targetExt so legacy snapshots dont wipe live state.
+function buildNamespaceUpdates(targetExt, currentExt, deleteValue) {
+    const updates = {};
+    if (!targetExt || Object.keys(targetExt).length === 0) return updates;
+    const namespaces = getKnownProviderNamespaces();
+    for (const ns of namespaces) {
+        const tNs = targetExt[ns];
+        const cNs = currentExt?.[ns];
+        const tHas = tNs && typeof tNs === 'object';
+        const cHas = cNs && typeof cNs === 'object';
+        if (!tHas && !cHas) continue;
+        if (!tHas && cHas) {
+            // Target lacks this namespace; local has it. Delete the whole namespace.
+            updates[`extensions.${ns}`] = deleteValue;
+            continue;
+        }
+        if (tHas && !cHas) {
+            // Local lacks it; target has it. Write each leaf from target.
+            for (const [k, v] of Object.entries(tNs)) {
+                updates[`extensions.${ns}.${k}`] = v;
+            }
+            continue;
+        }
+        // Both have the namespace. Write target leaves; sentinel-delete local-only leaves.
+        for (const [k, v] of Object.entries(tNs)) {
+            updates[`extensions.${ns}.${k}`] = v;
+        }
+        for (const k of Object.keys(cNs)) {
+            if (!(k in tNs)) {
+                updates[`extensions.${ns}.${k}`] = deleteValue;
+            }
+        }
+    }
+    return updates;
+}
+
+// Derived Provider Link summary for the diff row; getCharacterProvider picks the first linked provider, so it's active-agnostic. fullPath is the user-meaningful slug.
+function summarizeProviderLink(data) {
+    const charLike = { data };
+    const match = CoreAPI.getCharacterProvider(charLike);
+    if (!match?.linkInfo) return 'Unlinked';
+    const provider = match.provider;
+    const ref = match.linkInfo.fullPath || match.linkInfo.full_path || match.linkInfo.id || '';
+    return ref ? `${provider.name}: ${ref}` : provider.name;
+}
+
+function renderDiffPreview(previewEl, localData, compareData) {
+    // During shallow recovery localData.extensions is transiently empty; skip the render so namespaces dont all look deleted.
+    if (CoreAPI.isExtensionsRecoveryInProgress?.()) {
+        previewEl.innerHTML = `<div class="vt-preview-header"><i class="fa-solid fa-spinner fa-spin"></i> Character data still loading. Open the version diff again in a moment.</div>`;
+        return;
+    }
+
+    const fields = [
+        { key: 'name', label: 'Name', icon: 'fa-signature' },
+        { key: 'description', label: 'Description', long: true, icon: 'fa-align-left' },
+        { key: 'personality', label: 'Personality', long: true, icon: 'fa-brain' },
+        { key: 'scenario', label: 'Scenario', long: true, icon: 'fa-map' },
+        { key: 'first_mes', label: 'First Message', long: true, icon: 'fa-comment' },
+        { key: 'mes_example', label: 'Example Messages', long: true, icon: 'fa-comment-dots' },
+        { key: 'system_prompt', label: 'System Prompt', long: true, icon: 'fa-terminal' },
+        { key: 'post_history_instructions', label: 'Post-History Instructions', long: true, icon: 'fa-clipboard-list' },
+        { key: 'creator_notes', label: 'Creator Notes', long: true, icon: 'fa-note-sticky' },
+        { key: 'creator', label: 'Creator', icon: 'fa-user-pen' },
+        { key: 'tags', label: 'Tags', isArray: true, icon: 'fa-tags' },
+        { key: 'alternate_greetings', label: 'Alternate Greetings', long: true, isArray: true, icon: 'fa-comments' },
+        { key: 'nickname', label: 'Nickname', icon: 'fa-id-badge', optional: true },
+        { key: 'character_book', label: 'Embedded Lorebook', icon: 'fa-book' },
+    ];
+
+    // CL-owned display fallbacks (no provider); gate hides each when neither side carries one.
+    fields.push({ key: 'extensions.cl.tagline', label: 'Tagline', icon: 'fa-quote-left', optional: true });
+    fields.push({ key: 'extensions.cl.pageName', label: 'Listing Name', icon: 'fa-tag', optional: true });
+
+    // De-dup tracker so currentProvider.getComparableFields() and the all-providers loop dont push the same path twice.
+    const seenPaths = new Set();
+
+    // Active provider extras go first so currentProvider's labels win on collision.
+    if (currentProvider?.getComparableFields) {
+        for (const f of currentProvider.getComparableFields()) {
+            const icon = f.icon ? f.icon.replace(/^fa-solid\s+/, '') : 'fa-file-alt';
+            fields.push({ key: f.path, label: f.label, icon, optional: !!f.optional });
+            seenPaths.add(f.path);
+        }
+    }
+
+    // All known providers' tagline/pageName so stale orphan namespaces from prior links stay diffable; getAllProviders keeps provider.id correct (jannyai not janny).
+    const allProviders = CoreAPI.getAllProviders();
+    for (const p of allProviders) {
+        const taglinePath = `extensions.${p.id}.tagline`;
+        const pageNamePath = `extensions.${p.id}.pageName`;
+        if (!seenPaths.has(taglinePath)) {
+            fields.push({ key: taglinePath, label: `${p.name} Tagline`, icon: 'fa-quote-left', optional: true });
+            seenPaths.add(taglinePath);
+        }
+        if (!seenPaths.has(pageNamePath)) {
+            fields.push({ key: pageNamePath, label: `${p.name} Listing Name`, icon: 'fa-tag', optional: true });
+            seenPaths.add(pageNamePath);
+        }
+    }
+
+    let diffCount = 0;
+    let html = '';
+
+    // Avatar image - show the selected version/snapshot's avatar.
+    // Prefer the embedded image data (captured at snapshot time) over the live URL,
+    // so snapshots remain accurate after the character's PNG is overwritten.
+    const avatarUrl = compareData._avatarImageData || compareData._avatarUrl;
+    if (avatarUrl) {
+        html += renderAvatarPreview(avatarUrl);
+    }
+
+    // Provider Link summary row leads the diff; computed before the field loop.
+    const localLink = summarizeProviderLink(localData);
+    const remoteLink = summarizeProviderLink(compareData);
+    if (localLink !== remoteLink) {
+        const linkRendered = renderShortDiff({ label: 'Provider Link', icon: 'fa-link' }, localLink, remoteLink);
+        if (linkRendered) { diffCount++; html += linkRendered; }
+    }
+
+    for (const f of fields) {
+        const lv = nested(localData, f.key);
+        const rv = nested(compareData, f.key);
+
+        // Skip only when BOTH sides are empty, else a cleared-from-snapshot deletion would never show.
+        if (f.optional && (rv == null || rv === '') && (lv == null || lv === '')) continue;
+
+        // Lorebook needs semantic comparison (ST adds internal fields like uid, display_index)
+        if (f.key === 'character_book') {
+            if (lorebooksEqual(lv, rv)) continue;
+            const lbHtml = renderLorebookDiff(f, lv, rv);
+            if (!lbHtml) continue;
+            diffCount++;
+            html += lbHtml;
+            continue;
+        }
+
+        if (normVal(lv) === normVal(rv)) continue;
+
+        const rendered = (() => {
+            if (f.key === 'tags') return renderTagsDiff(f, lv, rv);
+            if (f.key === 'alternate_greetings') return renderGreetingsDiff(f, lv, rv);
+            if (f.long) return renderLongDiff(f, lv, rv);
+            return renderShortDiff(f, lv, rv);
+        })();
+        if (!rendered) continue;
+        diffCount++;
+        html += rendered;
+    }
+
+    if (diffCount === 0 && !html) {
+        previewEl.innerHTML = `<div class="vt-preview-header"><i class="fa-solid fa-check" style="color:var(--cl-success);"></i> Identical to your current local card.</div>`;
+        return;
+    }
+
+    previewEl.innerHTML = `
+        <div class="vt-preview-header">
+            <i class="fa-solid fa-arrow-right-arrow-left"></i>
+            ${diffCount} field${diffCount !== 1 ? 's' : ''} differ from local
+        </div>
+        <div class="vt-diff-list">${html}</div>
+    `;
+}
+
+function renderAvatarPreview(avatarUrl) {
+    if (!avatarUrl) return '';
+    return `
+        <div class="vt-avatar-preview">
+            <span class="vt-diff-label">Avatar</span>
+            <img class="vt-avatar-thumb" src="${esc(avatarUrl)}" alt="Version avatar"
+                 onerror="this.style.display='none'" loading="lazy" />
+            <button class="vt-btn vt-apply-avatar" data-avatar-url="${esc(avatarUrl)}"
+                    title="Apply this avatar to the character">
+                <i class="fa-solid fa-file-import"></i>
+            </button>
+        </div>
+    `;
+}
+
+function fieldIcon(field) {
+    return field.icon ? `<i class="fa-solid ${field.icon} vt-field-icon"></i>` : '';
+}
+
+function renderShortDiff(field, lv, rv) {
+    const ls = fmtVal(lv), rs = fmtVal(rv);
+    return `
+        <div class="vt-diff-item short">
+            <span class="vt-diff-label">${fieldIcon(field)}${esc(field.label)}</span>
+            <div class="vt-diff-vals">
+                <span class="vt-local" title="${esc(ls)}">${esc(CoreAPI.truncate(ls, 60))}</span>
+                <i class="fa-solid fa-arrow-right"></i>
+                <span class="vt-remote" title="${esc(rs)}">${esc(CoreAPI.truncate(rs, 60))}</span>
+            </div>
+        </div>`;
+}
+
+function renderLongDiff(field, lv, rv) {
+    const ls = fmtVal(lv), rs = fmtVal(rv);
+    const diff = lcs(ls.split('\n'), rs.split('\n'));
+    let added = 0, removed = 0;
+    diff.forEach(d => { if (d.t === 'a') added++; if (d.t === 'r') removed++; });
+    const totalLines = diff.length;
+
+    const stats = [];
+    if (added) stats.push(`<span class="vt-stat added">+${added}</span>`);
+    if (removed) stats.push(`<span class="vt-stat removed">-${removed}</span>`);
+
+    const lines = diff.map(d => {
+        const e = esc(d.l);
+        if (d.t === 'a') return `<div class="vt-diff-line added"><span class="vt-prefix">+</span>${e}</div>`;
+        if (d.t === 'r') return `<div class="vt-diff-line removed"><span class="vt-prefix">-</span>${e}</div>`;
+        return `<div class="vt-diff-line ctx"><span class="vt-prefix"> </span>${e}</div>`;
+    }).join('');
+
+    // Auto-expand small diffs (â‰¤8 lines total)
+    const autoExpand = totalLines <= 8 ? ' expanded' : '';
+
+    return `
+        <div class="vt-diff-item long${autoExpand}">
+            <div class="vt-diff-header">
+                <span class="vt-diff-label">${fieldIcon(field)}${esc(field.label)}</span>
+                <div class="vt-diff-stats">${stats.join(' ')}</div>
+                <i class="fa-solid fa-chevron-down vt-expand-icon"></i>
+            </div>
+            <div class="vt-diff-content">${lines || '<div class="vt-diff-line ctx">(empty)</div>'}</div>
+        </div>`;
+}
+
+function renderTagsDiff(field, localTags, remoteTags) {
+    const local = Array.isArray(localTags) ? localTags.map(t => String(t).trim()).filter(Boolean) : [];
+    const remote = Array.isArray(remoteTags) ? remoteTags.map(t => String(t).trim()).filter(Boolean) : [];
+    const localSet = new Set(local.map(t => t.toLowerCase()));
+    const remoteSet = new Set(remote.map(t => t.toLowerCase()));
+
+    const added = remote.filter(t => !localSet.has(t.toLowerCase()));
+    const removed = local.filter(t => !remoteSet.has(t.toLowerCase()));
+    const kept = local.filter(t => remoteSet.has(t.toLowerCase()));
+
+    if (!added.length && !removed.length) return '';
+
+    const stats = [];
+    if (added.length) stats.push(`<span class="vt-stat added">+${added.length}</span>`);
+    if (removed.length) stats.push(`<span class="vt-stat removed">-${removed.length}</span>`);
+
+    const pills = [
+        ...removed.map(t => `<span class="vt-tag-pill removed" title="Removed">${esc(t)}</span>`),
+        ...added.map(t => `<span class="vt-tag-pill added" title="Added">${esc(t)}</span>`),
+        ...kept.map(t => `<span class="vt-tag-pill">${esc(t)}</span>`),
+    ].join('');
+
+    return `
+        <div class="vt-diff-item long expanded">
+            <div class="vt-diff-header">
+                <span class="vt-diff-label">${fieldIcon(field)}${esc(field.label)}</span>
+                <div class="vt-diff-stats">${stats.join(' ')}</div>
+                <i class="fa-solid fa-chevron-down vt-expand-icon"></i>
+            </div>
+            <div class="vt-diff-content vt-tag-content">
+                <div class="vt-tag-pills">${pills || '<span class="vt-empty">(no tags)</span>'}</div>
+            </div>
+        </div>`;
+}
+
+function renderGreetingsDiff(field, localGreets, remoteGreets) {
+    const local = Array.isArray(localGreets) ? localGreets : [];
+    const remote = Array.isArray(remoteGreets) ? remoteGreets : [];
+    const max = Math.max(local.length, remote.length);
+
+    const stats = [];
+    if (remote.length > local.length) stats.push(`<span class="vt-stat added">+${remote.length - local.length}</span>`);
+    if (local.length > remote.length) stats.push(`<span class="vt-stat removed">-${local.length - remote.length}</span>`);
+
+    let blocks = '';
+    for (let i = 0; i < max; i++) {
+        const lv = typeof local[i] === 'string' ? local[i] : '';
+        const rv = typeof remote[i] === 'string' ? remote[i] : '';
+        if (lv === rv) continue;
+
+        const isNew = i >= local.length;
+        const isRemoved = i >= remote.length;
+        let badge = '';
+        if (isNew) badge = '<span class="vt-greeting-badge added">new</span>';
+        else if (isRemoved) badge = '<span class="vt-greeting-badge removed">removed</span>';
+        else badge = '<span class="vt-greeting-badge changed">changed</span>';
+
+        // Line diff for changed greetings
+        let content;
+        if (isNew) {
+            content = `<div class="vt-diff-line added"><span class="vt-prefix">+</span>${esc(rv)}</div>`;
+        } else if (isRemoved) {
+            content = `<div class="vt-diff-line removed"><span class="vt-prefix">-</span>${esc(lv)}</div>`;
+        } else {
+            const diff = lcs(lv.split('\n'), rv.split('\n'));
+            content = diff.map(d => {
+                const e = esc(d.l);
+                if (d.t === 'a') return `<div class="vt-diff-line added"><span class="vt-prefix">+</span>${e}</div>`;
+                if (d.t === 'r') return `<div class="vt-diff-line removed"><span class="vt-prefix">-</span>${e}</div>`;
+                return `<div class="vt-diff-line ctx"><span class="vt-prefix"> </span>${e}</div>`;
+            }).join('');
+        }
+
+        blocks += `
+            <div class="vt-greeting-block">
+                <div class="vt-greeting-header">
+                    <i class="fa-solid fa-chevron-right vt-greeting-expand-icon"></i>
+                    #${i + 1} ${badge}
+                </div>
+                <div class="vt-greeting-body">${content}</div>
+            </div>`;
+    }
+
+    if (!blocks) return '';
+
+    return `
+        <div class="vt-diff-item long">
+            <div class="vt-diff-header">
+                <span class="vt-diff-label">${fieldIcon(field)}${esc(field.label)}</span>
+                <div class="vt-diff-stats">${stats.join(' ')}</div>
+                <i class="fa-solid fa-chevron-down vt-expand-icon"></i>
+            </div>
+            <div class="vt-diff-content vt-greetings-content">${blocks}</div>
+        </div>`;
+}
+
+// ========================================
+// VERSION ACTIONS
+// ========================================
+
+async function restoreVersion() {
+    if (!currentChar) return;
+
+    let cardData = null;
+    let label = '';
+
+    if (activeTab === 'remote' && selectedVersionRef === '__provider_page__' && currentProvider?.supportsRemotePageVersion) {
+        cardData = await currentProvider.fetchRemotePageCard(currentLinkInfo);
+        label = `${currentProvider.name} metadata API state`;
+    } else if (activeTab === 'remote' && selectedVersionRef && currentProvider) {
+        const raw = await currentProvider.fetchVersionData(currentLinkInfo, selectedVersionRef);
+        if (!raw) { CoreAPI.showToast('Could not fetch version data', 'error'); return; }
+        cardData = raw; // provider returns flat card fields
+        label = `${currentProvider.name} version ${selectedVersionRef}`;
+    } else if (activeTab === 'local' && selectedSnapshotId) {
+        const lookupUid = getVersionUid(currentChar) || await lookupUidByAvatar(currentChar.avatar);
+        const snap = lookupUid ? await storageGetSnapshot(lookupUid, selectedSnapshotId) : null;
+        if (!snap) { CoreAPI.showToast('Snapshot not found', 'error'); return; }
+        cardData = snap.data;
+        label = `snapshot "${snap.label}"`;
+    } else {
+        CoreAPI.showToast('Nothing selected', 'warning');
+        return;
+    }
+
+    const name = currentChar.data?.name || currentChar.name || 'Unknown';
+    const ok = await confirmDialog('Restore Version',
+        `Overwrite "${name}" with ${label}?\n\nCurrent state will be backed up.`);
+    if (!ok) return;
+
+    const status = el('.vt-status');
+    status.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Restoring...';
+
+    try {
+        const curData = await extractCardData(currentChar);
+        const uid = await ensureVersionUid(currentChar);
+        await storageSaveBackup(currentChar.avatar, uid, curData);
+
+        // Auto-snapshot before restore
+        const ts = new Date().toLocaleString();
+        await storageSaveSnapshot(currentChar.avatar, name,
+            `Restore - ${ts}`, 'auto_backup', curData, uid);
+
+        const updates = {};
+        let lorebookRestored = false;
+        for (const f of CARD_FIELDS) {
+            if (f === 'character_book') {
+                const hasLocal = currentChar.data?.character_book?.entries?.length > 0;
+                const hasRemote = cardData[f]?.entries?.length > 0;
+                if (hasRemote) {
+                    updates[f] = cardData[f];
+                    if (activeTab === 'remote') lorebookRestored = true;
+                } else if (hasLocal && !hasRemote) {
+                    // Remote has no lorebook - clear embedded copy
+                    updates[f] = null;
+                }
+                continue;
+            }
+            if (cardData[f] !== undefined) {
+                updates[f] = cardData[f];
+            }
+        }
+
+        // Namespace-level restore: bring the snapshot's namespace shape in, sentinel-delete leaves/namespaces absent from it. Flat keys + orphan namespaces stay sticky via the spread; no-ops on empty-extensions legacy snapshots.
+        const deleteValue = await CoreAPI.getExtensionDeleteValue();
+        const nsUpdates = buildNamespaceUpdates(cardData?.extensions, currentChar.data?.extensions, deleteValue);
+        Object.assign(updates, nsUpdates);
+
+        const success = await CoreAPI.applyCardFieldUpdates(currentChar.avatar, updates);
+
+        // Merge remote lorebook entries into linked /worlds file
+        if (success && lorebookRestored) {
+            try {
+                await CoreAPI.mergeRemoteLorebookIntoWorldFile(currentChar.avatar, cardData.character_book);
+            } catch (worldErr) {
+                console.error('[CharVersions] World file merge failed:', worldErr);
+            }
+        }
+
+        if (success) {
+            if (activeTab === 'remote' && selectedVersionRef && currentProvider) {
+                const snapLabel = selectedVersionRef === '__provider_page__'
+                    ? `${currentProvider.name} metadata API (restored)` : `${currentProvider.name} v${selectedVersionRef} (restored)`;
+                const restoredTag = selectedVersionRef === '__provider_page__'
+                    ? 'provider_page' : selectedVersionRef;
+                await storageSaveSnapshot(currentChar.avatar, name,
+                    snapLabel, 'remote_restore', cardData, uid);
+                const extKey = `extensions.${currentProvider.id}`;
+                await CoreAPI.applyCardFieldUpdates(currentChar.avatar, {
+                    [`${extKey}.restored_version`]: restoredTag,
+                    [`${extKey}.restored_at`]: new Date().toISOString()
+                });
+            }
+            CoreAPI.showToast(`Restored ${label}`, 'success');
+            status.innerHTML = '<i class="fa-solid fa-check" style="color:var(--cl-success);"></i> Restored';
+            await CoreAPI.refreshCharacters(true);
+        } else {
+            CoreAPI.showToast('Restore failed', 'error');
+            status.innerHTML = '<i class="fa-solid fa-xmark"></i> Restore failed';
+        }
+    } catch (e) {
+        console.error('[CharVersions] restore:', e);
+        CoreAPI.showToast('Error: ' + e.message, 'error');
+        status.innerHTML = '<i class="fa-solid fa-xmark"></i> Restore failed';
+    }
+}
+
+async function undoRestore() {
+    if (!currentChar) return;
+    const uid = getVersionUid(currentChar) || await lookupUidByAvatar(currentChar.avatar);
+    const backup = uid ? await storageGetBackup(uid) : null;
+    if (!backup) { CoreAPI.showToast('No backup found', 'warning'); return; }
+
+    const name = currentChar.data?.name || currentChar.name || 'Unknown';
+    const ok = await confirmDialog('Undo Restore',
+        `Revert "${name}" to pre-restore state?\n\nBackup from: ${new Date(backup.timestamp).toLocaleString()}`);
+    if (!ok) return;
+
+    const status = el('.vt-status');
+    status.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Undoing...';
+
+    try {
+        // Cherry-pick CARD_FIELDS so we never write the synthetic _avatarUrl, then diff backup vs current namespaces so restore-introduced namespaces get sentinel-deleted.
+        const deleteValue = await CoreAPI.getExtensionDeleteValue();
+        const undoUpdates = {};
+        for (const f of CARD_FIELDS) {
+            if (backup.data?.[f] !== undefined) undoUpdates[f] = backup.data[f];
+        }
+        const undoNsUpdates = buildNamespaceUpdates(backup.data?.extensions, currentChar.data?.extensions, deleteValue);
+        Object.assign(undoUpdates, undoNsUpdates);
+        const s = await CoreAPI.applyCardFieldUpdates(currentChar.avatar, undoUpdates);
+        if (s) {
+            await storageClearBackup(uid);
+            // Clear restore metadata for the active provider
+            const provId = currentProvider?.id;
+            if (provId) {
+                const extKey = `extensions.${provId}`;
+                await CoreAPI.applyCardFieldUpdates(currentChar.avatar, {
+                    [`${extKey}.restored_version`]: null,
+                    [`${extKey}.restored_at`]: null
+                });
+            }
+            CoreAPI.showToast('Backup restored', 'success');
+            status.innerHTML = '<i class="fa-solid fa-check" style="color:var(--cl-success);"></i> Restored';
+            await CoreAPI.refreshCharacters(true);
+        } else {
+            CoreAPI.showToast('Undo failed', 'error');
+            status.innerHTML = '<i class="fa-solid fa-xmark"></i> Failed';
+        }
+    } catch (e) {
+        console.error('[CharVersions] undo:', e);
+        CoreAPI.showToast('Error undoing restore', 'error');
+    }
+}
+
+async function handleApplyAvatar(avatarUrl) {
+    if (!currentChar || !avatarUrl) return;
+
+    const name = currentChar.data?.name || currentChar.name || 'Unknown';
+    const ok = await confirmDialog('Apply Avatar',
+        `Replace "${name}"'s avatar with this version's image?`);
+    if (!ok) return;
+
+    const status = el('.vt-status');
+    status.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Applying avatar...';
+
+    try {
+        // Back up the current avatar before it's overwritten so the outgoing image stays restorable via Apply Avatar.
+        await autoSnapshotBeforeChange(currentChar, 'edit', { embedAvatar: true });
+
+        // Fetch image
+        const imgResp = await fetch(avatarUrl);
+        if (!imgResp.ok) throw new Error(`Failed to fetch image: ${imgResp.status}`);
+        const blob = await imgResp.blob();
+
+        // Build multipart form
+        const formData = new FormData();
+        formData.append('avatar', new File([blob], 'avatar.png', { type: blob.type || 'image/png' }));
+        formData.append('avatar_url', currentChar.avatar);
+
+        const csrfToken = CoreAPI.getCSRFToken();
+        const resp = await fetch('/api/characters/edit-avatar', {
+            method: 'POST',
+            headers: { 'X-CSRF-Token': csrfToken },
+            body: formData
+        });
+
+        if (resp.ok) {
+            CoreAPI.bumpAvatarCacheBust(currentChar.avatar);
+            CoreAPI.showToast('Avatar updated', 'success');
+            status.innerHTML = '<i class="fa-solid fa-check" style="color:var(--cl-success);"></i> Avatar applied';
+            await CoreAPI.refreshCharacters(true);
+        } else {
+            throw new Error(`Server returned ${resp.status}`);
+        }
+    } catch (e) {
+        console.error('[CharVersions] apply avatar:', e);
+        CoreAPI.showToast('Error applying avatar: ' + e.message, 'error');
+        status.innerHTML = '<i class="fa-solid fa-xmark"></i> Avatar update failed';
+    }
+}
+
+async function handleSaveSnapshot() {
+    if (!currentChar) return;
+    const label = await inputDialog('Save Snapshot', 'Label for this snapshot:',
+        `Snapshot ${new Date().toLocaleString()}`);
+    if (label === null) return;
+
+    try {
+        const uid = await ensureVersionUid(currentChar);
+        const data = await extractCardData(currentChar);
+        const name = currentChar.data?.name || currentChar.name || 'Unknown';
+        await storageSaveSnapshot(currentChar.avatar, name, label, 'local', data, uid);
+        CoreAPI.showToast(`Snapshot saved: "${label}"`, 'success');
+        if (activeTab === 'local') await loadLocalSnapshots();
+    } catch (e) {
+        console.error('[CharVersions] save snapshot:', e);
+        CoreAPI.showToast('Error saving snapshot', 'error');
+    }
+}
+
+async function handleDeleteSnapshot() {
+    if (!selectedSnapshotId) return;
+    const s = currentLocalSnapshots.find(s => s.id === selectedSnapshotId);
+    if (!s) return;
+
+    const ok = await confirmDialog('Delete Snapshot', `Delete "${s.label}"?\n\nThis cannot be undone.`);
+    if (!ok) return;
+
+    try {
+        const delUid = getVersionUid(currentChar) || await lookupUidByAvatar(currentChar.avatar);
+        if (delUid) await storageDeleteSnapshot(delUid, selectedSnapshotId);
+        CoreAPI.showToast('Snapshot deleted', 'success');
+        selectedSnapshotId = null;
+        const preview = el('.vt-preview');
+        if (preview) { preview.innerHTML = ''; preview.classList.add('vt-hidden'); }
+        el('.vt-actions')?.classList.add('vt-hidden');
+        await loadLocalSnapshots();
+    } catch (e) {
+        CoreAPI.showToast('Error deleting snapshot', 'error');
+    }
+}
+
+async function handleRenameSnapshot() {
+    if (!selectedSnapshotId) return;
+    const s = currentLocalSnapshots.find(s => s.id === selectedSnapshotId);
+    if (!s) return;
+
+    const newLabel = await inputDialog('Rename Snapshot', 'New label:', s.label);
+    if (newLabel === null || newLabel === s.label) return;
+
+    try {
+        const renameUid = getVersionUid(currentChar) || await lookupUidByAvatar(currentChar.avatar);
+        if (renameUid) await storageRenameSnapshot(renameUid, selectedSnapshotId, newLabel);
+        CoreAPI.showToast('Snapshot renamed', 'success');
+        await loadLocalSnapshots();
+    } catch (e) {
+        CoreAPI.showToast('Error renaming', 'error');
+    }
+}
+
+// ========================================
+// NORMALIZATION & HELPERS
+// ========================================
+
+function nested(obj, path) { return path.split('.').reduce((o, k) => o?.[k], obj); }
+
+// ========================================
+// LOREBOOK DIFF
+// ========================================
+
+function renderLorebookDiff(field, localBook, remoteBook) {
+    const localEntries = localBook?.entries || [];
+    const remoteEntries = remoteBook?.entries || [];
+    const { matched, added, removed } = matchLbEntries(localEntries, remoteEntries);
+    const modified = matched.filter(m => m.changedFields.length > 0);
+    const metaDiffs = compareLbMeta(localBook, remoteBook);
+
+    const localOnly = removed;
+
+    if (added.length === 0 && localOnly.length === 0 && modified.length === 0 && metaDiffs.length === 0) return '';
+
+    const statParts = [];
+    if (added.length > 0) statParts.push(`<span class="vt-stat added">+${added.length} new</span>`);
+    if (localOnly.length > 0) statParts.push(`<span class="vt-stat local-only">${localOnly.length} local only</span>`);
+    if (modified.length > 0) statParts.push(`<span class="vt-stat changed">${modified.length} modified</span>`);
+    if (metaDiffs.length > 0) statParts.push(`<span class="vt-stat changed">${metaDiffs.length} setting${metaDiffs.length > 1 ? 's' : ''}</span>`);
+    const stats = statParts.join(' ');
+
+    let sectionsHtml = '';
+
+    // --- Settings section ---
+    if (metaDiffs.length > 0) {
+        sectionsHtml += `<div class="vt-lb-section">
+            <div class="vt-lb-section-header" title="Click to expand">
+                <i class="fa-solid fa-gear vt-lb-section-icon"></i>
+                <span class="vt-lb-section-title">${metaDiffs.length} setting${metaDiffs.length > 1 ? 's' : ''} changed</span>
+                <i class="fa-solid fa-chevron-down vt-lb-section-chevron"></i>
+            </div>
+            <div class="vt-lb-section-body">
+                ${metaDiffs.map(m => `<div class="vt-lb-meta-row">
+                    <span class="vt-lb-meta-key">${esc(m.label)}</span>
+                    <span class="vt-lb-meta-old">${esc(m.localStr)}</span>
+                    <i class="fa-solid fa-arrow-right"></i>
+                    <span class="vt-lb-meta-new">${esc(m.remoteStr)}</span>
+                </div>`).join('')}
+            </div>
+        </div>`;
+    }
+
+    // --- New entries section ---
+    if (added.length > 0) {
+        const autoExpand = added.length <= 5;
+        sectionsHtml += `<div class="vt-lb-section${autoExpand ? ' expanded' : ''}">
+            <div class="vt-lb-section-header" title="Click to expand">
+                <span class="vt-lb-badge added" style="width:16px;height:16px;font-size:10px;">+</span>
+                <span class="vt-lb-section-title">${added.length} new from remote</span>
+                <i class="fa-solid fa-chevron-down vt-lb-section-chevron"></i>
+            </div>
+            <div class="vt-lb-section-body">
+                ${added.map(entry => {
+                    const name = lbEntryName(entry);
+                    const keys = (entry.keys || []).slice(0, 4).join(', ');
+                    return `<div class="vt-lb-entry added">
+                        <span class="vt-lb-name">${esc(name)}</span>
+                        ${keys ? `<span class="vt-lb-keys">${esc(keys)}</span>` : ''}
+                    </div>`;
+                }).join('')}
+            </div>
+        </div>`;
+    }
+
+    // --- Local-only entries section ---
+    if (localOnly.length > 0) {
+        const autoExpand = localOnly.length <= 5;
+        sectionsHtml += `<div class="vt-lb-section${autoExpand ? ' expanded' : ''}">
+            <div class="vt-lb-section-header" title="Click to expand">
+                <span class="vt-lb-badge local-only" style="width:16px;height:16px;font-size:10px;">&#9733;</span>
+                <span class="vt-lb-section-title">${localOnly.length} local-only (not in this version)</span>
+                <i class="fa-solid fa-chevron-down vt-lb-section-chevron"></i>
+            </div>
+            <div class="vt-lb-section-body">
+                ${localOnly.map(entry => {
+                    const name = lbEntryName(entry);
+                    const keys = (entry.keys || []).slice(0, 4).join(', ');
+                    const keysJson = esc(JSON.stringify(entry.keys || []));
+                    const entryComment = esc(entry.comment || entry.name || '');
+                    return `<div class="vt-lb-entry local-only" data-lb-keys="${keysJson}" data-lb-name="${entryComment}">
+                        <span class="vt-lb-name">${esc(name)}</span>
+                        <span class="vt-lb-world-check"><i class="fa-solid fa-spinner fa-spin" style="font-size:10px;opacity:0.4;"></i></span>
+                        ${keys ? `<span class="vt-lb-keys">${esc(keys)}</span>` : ''}
+                    </div>`;
+                }).join('')}
+            </div>
+        </div>`;
+    }
+
+    // --- Modified entries section ---
+    if (modified.length > 0) {
+        const autoExpand = modified.length <= 5;
+        sectionsHtml += `<div class="vt-lb-section${autoExpand ? ' expanded' : ''}">
+            <div class="vt-lb-section-header" title="Click to expand">
+                <span class="vt-lb-badge modified" style="width:16px;height:16px;font-size:10px;">~</span>
+                <span class="vt-lb-section-title">${modified.length} modified</span>
+                <i class="fa-solid fa-chevron-down vt-lb-section-chevron"></i>
+            </div>
+            <div class="vt-lb-section-body">
+                ${modified.map(m => {
+                    const name = lbEntryName(m.remote);
+                    const changes = m.changedFields.join(', ');
+                    return `<div class="vt-lb-entry modified">
+                        <span class="vt-lb-name">${esc(name)}</span>
+                        <span class="vt-lb-changes">${esc(changes)}</span>
+                    </div>`;
+                }).join('')}
+            </div>
+        </div>`;
+    }
+
+    // --- Unchanged summary ---
+    const unchangedCount = matched.length - modified.length;
+    if (unchangedCount > 0) {
+        sectionsHtml += `<div class="vt-lb-unchanged-row">
+            <span class="vt-lb-unchanged">${unchangedCount} unchanged entr${unchangedCount === 1 ? 'y' : 'ies'}</span>
+        </div>`;
+    }
+
+    const mergedCount = matched.length + added.length + localOnly.length;
+
+    return `
+        <div class="vt-diff-item long" data-local-only-count="${localOnly.length}">
+            <div class="vt-diff-header vt-lb-header">
+                <div class="vt-lb-header-top">
+                    <span class="vt-diff-label">${fieldIcon(field)}${esc(field.label)}
+                        <span class="vt-lb-counts">
+                            <span>${localEntries.length}</span>
+                            <i class="fa-solid fa-arrow-right"></i>
+                            <span>${mergedCount}</span>
+                        </span>
+                    </span>
+                    <i class="fa-solid fa-chevron-down vt-expand-icon"></i>
+                </div>
+                <div class="vt-lb-stat-row">${stats}</div>
+            </div>
+            <div class="vt-diff-content vt-lb-content">
+                ${sectionsHtml}
+            </div>
+        </div>
+    `;
+}
+
+function lbEntryName(entry) {
+    if (entry.comment?.trim()) return entry.comment.trim();
+    if (entry.name?.trim()) return entry.name.trim();
+    const keys = entry.keys || [];
+    if (keys.length > 0) return keys.slice(0, 3).join(', ');
+    return `Entry #${entry.id ?? '?'}`;
+}
+
+async function resolveVersionWorldFileStatus(containerEl, avatar) {
+    if (!containerEl || !avatar) return;
+    const rows = containerEl.querySelectorAll('.vt-lb-entry.local-only[data-lb-keys]');
+    if (rows.length === 0) return;
+
+    const clearSpinners = (reason) => {
+        for (const row of rows) {
+            const check = row.querySelector('.vt-lb-world-check');
+            if (check) { check.innerHTML = ''; check.title = reason; }
+        }
+    };
+
+    try {
+        let worldName = CoreAPI.getCharacterWorldName(avatar);
+
+        if (!worldName) {
+            const charName = (currentChar?.name || '').trim();
+            if (charName) {
+                const allWorlds = (await CoreAPI.listWorldInfoFiles()).map(w => w.file_id);
+                const lower = charName.toLowerCase();
+                worldName = allWorlds.find(w => w.toLowerCase() === lower)
+                         || allWorlds.find(w => w.toLowerCase().includes(lower) || lower.includes(w.toLowerCase()))
+                         || null;
+            }
+        }
+
+        if (!worldName) { clearSpinners('No linked World Info file found.'); return; }
+
+        let worldData;
+        try { worldData = await CoreAPI.getWorldInfoData(worldName); } catch (_) { /* fetch failed */ }
+
+        if (!worldData?.entries) { clearSpinners(`World Info file "${worldName}" could not be read.`); return; }
+
+        const worldEntries = Object.values(worldData.entries).filter(e => e && typeof e === 'object');
+
+        const expandKeys = (keys) => {
+            const set = new Set();
+            for (const k of (keys || [])) {
+                for (const part of String(k).split(',')) {
+                    const t = part.toLowerCase().trim();
+                    if (t) set.add(t);
+                }
+            }
+            return set;
+        };
+
+        for (const row of rows) {
+            let entryKeys;
+            try { entryKeys = JSON.parse(row.dataset.lbKeys || '[]'); } catch (_) { entryKeys = []; }
+            const entryName = (row.dataset.lbName || '').toLowerCase().trim();
+            const embeddedKeys = expandKeys(entryKeys);
+
+            let found = false;
+            for (const we of worldEntries) {
+                const wKeys = expandKeys(we.key);
+                if (embeddedKeys.size > 0 && wKeys.size > 0) {
+                    let inter = 0;
+                    for (const k of embeddedKeys) { if (wKeys.has(k)) inter++; }
+                    const union = new Set([...embeddedKeys, ...wKeys]).size;
+                    if (union > 0 && (inter / union) > 0.3) { found = true; break; }
+                }
+                const wName = (we.comment || '').toLowerCase().trim();
+                if (entryName && wName && (entryName === wName || entryName.includes(wName) || wName.includes(entryName))) {
+                    found = true; break;
+                }
+            }
+
+            const check = row.querySelector('.vt-lb-world-check');
+            if (found) {
+                if (check) {
+                    check.innerHTML = '<i class="fa-solid fa-shield-halved" style="color:var(--cl-success-pale);font-size:11px;"></i>';
+                    check.title = `Also in World Info file "${worldName}"`;
+                }
+            } else {
+                if (check) {
+                    check.innerHTML = '<i class="fa-solid fa-triangle-exclamation" style="color:#ffb74d;font-size:11px;"></i>';
+                    check.title = `Not found in World Info file "${worldName}"`;
+                }
+            }
+        }
+    } catch (err) {
+        console.error('[CharVersions] resolveVersionWorldFileStatus error:', err);
+        clearSpinners('World Info check failed.');
+    }
+}
+
+function matchLbEntries(localEntries, remoteEntries) {
+    const matched = [];
+    const usedRemote = new Set();
+    const removed = [];
+
+    // Forward pass + positional tie-break: on tied Jaccard scores prefer the remote closest in position, so an unchanged lorebook doesnt diff as a wall of fake changes.
+    for (let i = 0; i < localEntries.length; i++) {
+        const local = localEntries[i];
+        let bestIdx = -1;
+        let bestScore = 0;
+
+        for (let j = 0; j < remoteEntries.length; j++) {
+            if (usedRemote.has(j)) continue;
+            const score = lbMatchScore(local, remoteEntries[j]);
+            if (score > bestScore || (score === bestScore && score > 0 && bestIdx >= 0 && Math.abs(j - i) < Math.abs(bestIdx - i))) {
+                bestScore = score;
+                bestIdx = j;
+            }
+        }
+
+        if (bestIdx >= 0 && bestScore > 0.3) {
+            usedRemote.add(bestIdx);
+            const changedFields = compareLbFields(local, remoteEntries[bestIdx]);
+            matched.push({ local, remote: remoteEntries[bestIdx], changedFields });
+        } else {
+            removed.push(local);
+        }
+    }
+
+    const added = remoteEntries.filter((_, j) => !usedRemote.has(j));
+    return { matched, added, removed };
+}
+
+function lbMatchScore(a, b) {
+    const expandKeys = (entry) => {
+        const raw = entry.keys || [];
+        const expanded = new Set();
+        for (const k of raw) {
+            for (const part of String(k).split(',')) {
+                const trimmed = part.toLowerCase().trim();
+                if (trimmed) expanded.add(trimmed);
+            }
+        }
+        return expanded;
+    };
+
+    const aKeys = expandKeys(a);
+    const bKeys = expandKeys(b);
+
+    if (aKeys.size > 0 && bKeys.size > 0) {
+        let intersection = 0;
+        for (const k of aKeys) { if (bKeys.has(k)) intersection++; }
+        const union = new Set([...aKeys, ...bKeys]).size;
+        if (union > 0) {
+            const jaccard = intersection / union;
+            if (jaccard > 0) return jaccard;
+        }
+    }
+
+    const aName = (a.comment || a.name || '').toLowerCase().trim();
+    const bName = (b.comment || b.name || '').toLowerCase().trim();
+    if (aName && bName) {
+        if (aName === bName) return 1;
+        if (aName.includes(bName) || bName.includes(aName)) return 0.8;
+    }
+
+    const aCont = (a.content || '').slice(0, 200).toLowerCase().trim();
+    const bCont = (b.content || '').slice(0, 200).toLowerCase().trim();
+    if (aCont.length > 20 && bCont.length > 20 && aCont === bCont) return 0.7;
+
+    return 0;
+}
+
+function compareLbFields(local, remote) {
+    const changed = [];
+    for (const f of LB_ENTRY_FIELDS) {
+        if (f === 'id' || f === 'name' || f === 'comment') continue;
+        if (JSON.stringify(local[f] ?? null) !== JSON.stringify(remote[f] ?? null)) {
+            changed.push(f);
+        }
+    }
+    return changed;
+}
+
+const LB_META_FIELDS = {
+    name: 'Name',
+    description: 'Description',
+    scan_depth: 'Scan Depth',
+    token_budget: 'Token Budget',
+    recursive_scanning: 'Recursive Scanning',
+};
+
+// V2-spec entry fields - everything else (uid, display_index, vectorized, etc.) is ST-internal
+const LB_ENTRY_FIELDS = [
+    'keys', 'secondary_keys', 'content', 'enabled', 'selective',
+    'constant', 'position', 'insertion_order', 'priority', 'case_sensitive',
+    'name', 'comment', 'id'
+];
+
+function normalizeLbEntry(entry) {
+    const out = {};
+    for (const f of LB_ENTRY_FIELDS) {
+        if (entry[f] !== undefined) out[f] = entry[f];
+    }
+    return out;
+}
+
+function lorebooksEqual(a, b) {
+    const aEntries = a?.entries || [];
+    const bEntries = b?.entries || [];
+    const aEmpty = aEntries.length === 0;
+    const bEmpty = bEntries.length === 0;
+    if (aEmpty && bEmpty) return true;
+
+    for (const key of Object.keys(LB_META_FIELDS)) {
+        if (JSON.stringify(a?.[key] ?? null) !== JSON.stringify(b?.[key] ?? null)) return false;
+    }
+
+    if (aEntries.length !== bEntries.length) return false;
+    for (let i = 0; i < aEntries.length; i++) {
+        const na = normalizeLbEntry(aEntries[i]);
+        const nb = normalizeLbEntry(bEntries[i]);
+        if (JSON.stringify(na) !== JSON.stringify(nb)) return false;
+    }
+    return true;
+}
+
+function compareLbMeta(localBook, remoteBook) {
+    const diffs = [];
+    for (const [key, label] of Object.entries(LB_META_FIELDS)) {
+        const lv = localBook?.[key];
+        const rv = remoteBook?.[key];
+        if (JSON.stringify(lv ?? null) !== JSON.stringify(rv ?? null)) {
+            diffs.push({
+                key,
+                label,
+                localStr: lv == null ? '(not set)' : typeof lv === 'object' ? JSON.stringify(lv) : String(lv),
+                remoteStr: rv == null ? '(not set)' : typeof rv === 'object' ? JSON.stringify(rv) : String(rv)
+            });
+        }
+    }
+    return diffs;
+}
+
+function normVal(v) {
+    if (v == null) return '';
+    if (Array.isArray(v)) {
+        const n = [...v].map(x => typeof x === 'string' ? x.replace(/\r\n/g, '\n').trim() : JSON.stringify(x));
+        n.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+        return JSON.stringify(n);
+    }
+    if (typeof v === 'object') return JSON.stringify(v);
+    return String(v).replace(/\r\n/g, '\n').trim();
+}
+
+function fmtVal(v) {
+    if (v == null) return '(empty)';
+    if (Array.isArray(v)) return v.length ? v.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(', ') : '(empty)';
+    if (typeof v === 'string' && !v.trim()) return '(empty)';
+    if (typeof v === 'object') return JSON.stringify(v, null, 2);
+    return String(v);
+}
+
+function esc(s) { return CoreAPI.escapeHtml(s); }
+
+function relTime(d) {
+    const ms = Date.now() - d;
+    const m = Math.floor(ms / 60000);
+    if (m < 1) return 'just now';
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(ms / 3600000);
+    if (h < 24) return `${h}h ago`;
+    const dy = Math.floor(ms / 86400000);
+    if (dy < 30) return `${dy}d ago`;
+    const mo = Math.floor(dy / 30);
+    if (mo < 12) return `${mo}mo ago`;
+    return `${Math.floor(dy / 365)}y ago`;
+}
+
+/** LCS-based line diff */
+function lcs(oldL, newL) {
+    const m = oldL.length, n = newL.length;
+    const dp = Array(m + 1).fill(null).map(() => Array(n + 1).fill(0));
+    for (let i = 1; i <= m; i++)
+        for (let j = 1; j <= n; j++)
+            dp[i][j] = oldL[i - 1] === newL[j - 1] ? dp[i - 1][j - 1] + 1 : Math.max(dp[i - 1][j], dp[i][j - 1]);
+
+    const res = [];
+    let i = m, j = n;
+    while (i > 0 || j > 0) {
+        if (i > 0 && j > 0 && oldL[i - 1] === newL[j - 1]) {
+            res.unshift({ t: 'c', l: oldL[i - 1] }); i--; j--;
+        } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+            res.unshift({ t: 'a', l: newL[j - 1] }); j--;
+        } else {
+            res.unshift({ t: 'r', l: oldL[i - 1] }); i--;
+        }
+    }
+    return res;
+}
+
+// ========================================
+// DIALOGS
+// ========================================
+
+function confirmDialog(title, msg) {
+    return new Promise(resolve => {
+        _dialogOpen = true;
+        const ov = document.createElement('div');
+        ov.className = 'vt-dialog-overlay';
+        ov.id = 'vtDialog';
+        ov.innerHTML = `
+            <div class="vt-dialog">
+                <div class="vt-dialog-title">${esc(title)}</div>
+                <div class="vt-dialog-msg">${esc(msg).replace(/\n/g, '<br>')}</div>
+                <div class="vt-dialog-btns">
+                    <button class="vt-dialog-btn" data-a="cancel">Cancel</button>
+                    <button class="vt-dialog-btn primary" data-a="ok">Confirm</button>
+                </div>
+            </div>`;
+        const close = (val) => {
+            if (!ov.parentNode) return; // already removed
+            ov.remove();
+            requestAnimationFrame(() => { _dialogOpen = false; resolve(val); });
+        };
+        ov._closeFn = () => close(false); // registry (Escape / Android back) resolves as cancel
+        ov.addEventListener('click', e => { e.stopPropagation(); if (e.target === ov) close(false); });
+        ov.querySelector('[data-a="cancel"]').addEventListener('click', (e) => { e.stopPropagation(); close(false); });
+        ov.querySelector('[data-a="ok"]').addEventListener('click', (e) => { e.stopPropagation(); close(true); });
+        document.body.appendChild(ov);
+    });
+}
+
+function inputDialog(title, msg, defaultVal = '') {
+    return new Promise(resolve => {
+        _dialogOpen = true;
+        const ov = document.createElement('div');
+        ov.className = 'vt-dialog-overlay';
+        ov.id = 'vtDialog';
+        ov.innerHTML = `
+            <div class="vt-dialog">
+                <div class="vt-dialog-title">${esc(title)}</div>
+                <div class="vt-dialog-msg">${esc(msg)}</div>
+                <input type="text" class="vt-input" value="${esc(defaultVal)}" autocomplete="one-time-code" />
+                <div class="vt-dialog-btns">
+                    <button class="vt-dialog-btn" data-a="cancel">Cancel</button>
+                    <button class="vt-dialog-btn primary" data-a="ok">OK</button>
+                </div>
+            </div>`;
+        const inp = ov.querySelector('.vt-input');
+        const close = (val) => {
+            if (!ov.parentNode) return;
+            ov.remove();
+            requestAnimationFrame(() => { _dialogOpen = false; resolve(val); });
+        };
+        ov._closeFn = () => close(null); // registry (Escape / Android back) resolves as cancel
+        // Enter only; Escape/back come from the registered overlay (registry close resolves null).
+        inp.addEventListener('keydown', e => {
+            if (e.key === 'Enter') close(inp.value.trim());
+        });
+        ov.querySelector('[data-a="cancel"]').addEventListener('click', (e) => { e.stopPropagation(); close(null); });
+        ov.querySelector('[data-a="ok"]').addEventListener('click', (e) => { e.stopPropagation(); close(inp.value.trim()); });
+        ov.addEventListener('click', e => { if (e.target === ov) close(null); });
+        document.body.appendChild(ov);
+        setTimeout(() => inp.select(), 50);
+    });
+}
+
+// ========================================
+// EXPORTS
+// ========================================
+
+export default {
+    init,
+    openVersionHistory,
+    renderVersionsPane,
+    cleanupVersionsPane,
+    saveCurrentSnapshot,
+    autoSnapshotBeforeChange
+};

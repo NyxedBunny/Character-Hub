@@ -1,0 +1,497 @@
+/**
+ * Module Loader for SillyTavern Character Library
+ *
+ * Two-tier initialization:
+ *   Tier 1 - Loaded immediately (critical for Characters grid / detail modal)
+ *   Tier 2 - Lazily loaded on first use via proxy stubs
+ */
+
+import ProviderRegistry from './providers/provider-registry.js';
+import CoreAPI from './core-api.js';
+
+
+// ========================================
+// CSS LOADER
+// ========================================
+
+const MODULE_CSS_VERSION = 79;
+
+function loadModuleCSS(path) {
+    return new Promise((resolve) => {
+        const link = document.createElement('link');
+        link.rel = 'stylesheet';
+        const url = new URL(path, import.meta.url);
+        url.searchParams.set('v', MODULE_CSS_VERSION);
+        link.href = url.href;
+        link.onload = resolve;
+        link.onerror = resolve;
+        document.head.appendChild(link);
+    });
+}
+
+
+// ========================================
+// LAZY BRIDGE HELPERS
+// ========================================
+
+/**
+ * Creates a group of window.* bridges that share a single dynamic import.
+ * On first invocation of ANY bridge in the group the module is imported once;
+ * setupFn then replaces every stub with the real function so subsequent calls
+ * go straight through with zero overhead.
+ */
+function createLazyBridgeGroup(importFn, setupFn) {
+    let loading = null;
+
+    function ensureLoaded() {
+        if (!loading) {
+            loading = importFn().then(mod => {
+                setupFn(mod);
+                return mod;
+            }).catch(err => {
+                console.error('[ModuleLoader] Lazy load failed:', err);
+                loading = null;
+                throw err;
+            });
+        }
+        return loading;
+    }
+
+    /**
+     * Returns a stub that, on call, triggers the shared import then resolves
+     * getTarget() - which by that point has been replaced with the real
+     * function by setupFn - and forwards the original arguments.
+     */
+    function createStub(getTarget) {
+        return function (...args) {
+            return ensureLoaded().then(() => {
+                const realFn = getTarget();
+                if (typeof realFn === 'function') {
+                    return realFn(...args);
+                }
+            });
+        };
+    }
+
+    return { ensureLoaded, createStub };
+}
+
+
+// ========================================
+// MODULE REGISTRY
+// ========================================
+
+const ModuleLoader = {
+    modules: {},
+    _lazyLoaders: {},
+    _lazyPromises: {},
+    initialized: false,
+
+    register(name, module) {
+        this.modules[name] = module;
+        delete this._lazyLoaders[name];
+        window.debugLog?.(`[ModuleLoader] Registered module: ${name}`);
+    },
+
+    async initAll(dependencies) {
+        for (const [name, module] of Object.entries(this.modules)) {
+            try {
+                if (module.init && !module._mlInitDone) {
+                    await module.init(dependencies);
+                    module._mlInitDone = true;
+                    window.debugLog?.(`[ModuleLoader] Initialized module: ${name}`);
+                }
+            } catch (err) {
+                console.error(`[ModuleLoader] Failed to initialize module: ${name}`, err);
+            }
+        }
+        this.initialized = true;
+    },
+
+    get(name) {
+        if (this.modules[name]) return this.modules[name];
+        if (this._lazyLoaders[name]) return this._createLazyProxy(name);
+        return null;
+    },
+
+    async ensureLoaded(name) {
+        if (this.modules[name]) return this.modules[name];
+        const loader = this._lazyLoaders[name];
+        if (loader) {
+            await loader();
+            return this.modules[name];
+        }
+        return null;
+    },
+
+    _registerLazy(name, loadFn) {
+        this._lazyLoaders[name] = () => {
+            if (!this._lazyPromises[name]) {
+                this._lazyPromises[name] = loadFn().catch(err => {
+                    console.error(`[ModuleLoader] Lazy load of '${name}' failed:`, err);
+                    delete this._lazyPromises[name];
+                    throw err;
+                });
+            }
+            return this._lazyPromises[name];
+        };
+    },
+
+    /**
+     * Returns a Proxy whose property accesses produce async stub functions.
+     * Callers like:
+     *     const mod = CoreAPI.getModule('batch-tagging');
+     *     if (mod?.openModal) { mod.openModal(); }
+     * transparently trigger the lazy import on first method call.
+     */
+    _createLazyProxy(name) {
+        const self = this;
+        return new Proxy({}, {
+            get(target, prop) {
+                if (prop === 'then' || prop === Symbol.toPrimitive || prop === Symbol.toStringTag) {
+                    return undefined;
+                }
+                return function (...args) {
+                    return self.ensureLoaded(name).then(mod => {
+                        if (mod && typeof mod[prop] === 'function') {
+                            return mod[prop](...args);
+                        }
+                    });
+                };
+            }
+        });
+    }
+};
+
+
+// ========================================
+// INITIALIZATION
+// ========================================
+
+async function initModuleSystem() {
+    window.debugLog?.('[ModuleLoader] Initializing module system...');
+
+    const dependencies = {};
+
+    // ============================
+    // TIER 1 - Immediate modules
+    // ============================
+
+    try {
+        const multiSelectModule = await import('./multi-select.js');
+        loadModuleCSS('./multi-select.css');
+        ModuleLoader.register('multi-select', multiSelectModule.default);
+    } catch (err) {
+        console.warn('[ModuleLoader] Could not load multi-select module:', err);
+    }
+
+    try {
+        const contextMenuModule = await import('./context-menu.js');
+        loadModuleCSS('./context-menu.css');
+        ModuleLoader.register('context-menu', contextMenuModule.default);
+    } catch (err) {
+        console.warn('[ModuleLoader] Could not load context-menu module:', err);
+    }
+
+    try {
+        const galleryViewerModule = await import('./gallery-viewer.js');
+        loadModuleCSS('./gallery-viewer.css');
+        ModuleLoader.register('gallery-viewer', galleryViewerModule.default);
+
+        window.openGalleryViewer = galleryViewerModule.openViewer;
+        window.openGalleryViewerWithImages = galleryViewerModule.openViewerWithImages;
+        window.closeGalleryViewer = galleryViewerModule.closeViewer;
+    } catch (err) {
+        console.warn('[ModuleLoader] Could not load gallery-viewer module:', err);
+    }
+
+    try {
+        const charVersionsModule = await import('./character-versions.js');
+        loadModuleCSS('./character-versions.css');
+        ModuleLoader.register('character-versions', charVersionsModule.default);
+
+        window.renderVersionsPane = charVersionsModule.renderVersionsPane;
+        window.cleanupVersionsPane = charVersionsModule.cleanupVersionsPane;
+        window.autoSnapshotBeforeChange = charVersionsModule.autoSnapshotBeforeChange;
+    } catch (err) {
+        console.warn('[ModuleLoader] Could not load character-versions module:', err);
+    }
+
+    try {
+        loadModuleCSS('./card-updates.css');
+        const cardUpdatesModule = await import('./card-updates.js');
+        ModuleLoader.register('card-updates', cardUpdatesModule.default);
+
+        window.checkAllCardUpdates = cardUpdatesModule.checkAllLinkedCharacters;
+    } catch (err) {
+        console.warn('[ModuleLoader] Could not load card-updates module:', err);
+    }
+
+    try {
+        loadModuleCSS('./gallery-sync.css');
+        const gallerySyncModule = await import('./gallery-sync.js');
+        ModuleLoader.register('gallery-sync', gallerySyncModule.default);
+
+        window.auditGalleryIntegrity = gallerySyncModule.auditGalleryIntegrity;
+        window.updateGallerySyncWarning = gallerySyncModule.updateWarningIndicator;
+    } catch (err) {
+        console.warn('[ModuleLoader] Could not load gallery-sync module:', err);
+    }
+
+    try {
+        loadModuleCSS('./recommender.css');
+        const recommenderModule = await import('./recommender.js');
+        ModuleLoader.register('recommender', recommenderModule.default);
+
+        window.openRecommender = recommenderModule.openModal;
+    } catch (err) {
+        console.warn('[ModuleLoader] Could not load recommender module:', err);
+    }
+
+    try {
+        loadModuleCSS('./custom-css.css');
+        const customCssModule = await import('./custom-css.js');
+        ModuleLoader.register('custom-css', customCssModule.default);
+
+        window.openCustomCssModal = customCssModule.openModal;
+    } catch (err) {
+        console.warn('[ModuleLoader] Could not load custom-css module:', err);
+    }
+
+    try {
+        loadModuleCSS('./css-assistant.css');
+        const cssAssistantModule = await import('./css-assistant.js');
+        ModuleLoader.register('css-assistant', cssAssistantModule.default);
+    } catch (err) {
+        console.warn('[ModuleLoader] Could not load css-assistant module:', err);
+    }
+
+    try {
+        loadModuleCSS('./character-creator.css');
+        const creatorModule = await import('./character-creator.js');
+        ModuleLoader.register('character-creator', creatorModule.default);
+
+        window.openCharacterCreator = creatorModule.openModal;
+        window.closeCharacterCreator = creatorModule.closeModal;
+        window.closeAiStudio = creatorModule.closeStudio;
+        window.closeNotesPreview = creatorModule.closeNotesPreview;
+    } catch (err) {
+        console.warn('[ModuleLoader] Could not load character-creator module:', err);
+    }
+
+    try {
+        loadModuleCSS('./lorebook-manager.css');
+        const lorebookModule = await import('./lorebook-manager.js');
+        ModuleLoader.register('lorebook-manager', lorebookModule.default);
+
+        window.openLorebookManager = lorebookModule.openModal;
+    } catch (err) {
+        console.warn('[ModuleLoader] Could not load lorebook-manager module:', err);
+    }
+
+    try {
+        loadModuleCSS('./playlists.css');
+        const playlistsModule = await import('./playlists.js');
+        ModuleLoader.register('playlists', playlistsModule.default);
+
+        window.playlistsLoadPlaylists = playlistsModule.loadPlaylists;
+        window.playlistsRemoveFromPlaylist = playlistsModule.removeFromPlaylist;
+        window.playlistsGetAll = playlistsModule.getAllPlaylists;
+        window.playlistsGetPlaylist = playlistsModule.getPlaylist;
+        window.playlistsGetCharacters = playlistsModule.getPlaylistCharacters;
+        window.playlistsGetAvatarSet = playlistsModule.getPlaylistAvatarSet;
+        window.playlistsGetForChar = playlistsModule.getPlaylistsForChar;
+        window.playlistsIsCharInAny = playlistsModule.isCharInAnyPlaylist;
+        window.playlistsOnCharDeleted = playlistsModule.onCharacterDeleted;
+        window.playlistsPruneDeleted = playlistsModule.pruneDeletedCharacters;
+        window.openPlaylistPicker = playlistsModule.openPlaylistPicker;
+        window.openPlaylistManager = playlistsModule.openPlaylistManager;
+    } catch (err) {
+        console.warn('[ModuleLoader] Could not load playlists module:', err);
+    }
+
+    try {
+        loadModuleCSS('./media-download-queue.css');
+        const mediaQueueModule = await import('./media-download-queue.js');
+        ModuleLoader.register('media-download-queue', mediaQueueModule.default);
+
+        window.enqueueMediaDownloadJob = mediaQueueModule.enqueueJob;
+        window.mediaDownloadQueueOnCharDeleted = mediaQueueModule.onCharacterDeleted;
+    } catch (err) {
+        console.warn('[ModuleLoader] Could not load media-download-queue module:', err);
+    }
+
+    // Gallery Extractors - lazy-loaded on first use to save memory
+    // All call sites guard with typeof window.extractGalleryImages === 'function'
+    let _extractorsLoaded = false;
+    async function ensureExtractorsLoaded() {
+        if (_extractorsLoaded) return;
+        _extractorsLoaded = true;
+        try {
+            const { findCharacterGalleryUrls, extractGalleryImages, identifyGallerySources } = await import('./gallery-extractors/extractor-registry.js');
+            await Promise.all([
+                import('./gallery-extractors/imgchest.js'),
+                import('./gallery-extractors/imgbb.js'),
+                import('./gallery-extractors/gdrive.js'),
+                import('./gallery-extractors/catbox.js'),
+                import('./gallery-extractors/mega.js'),
+                import('./gallery-extractors/postimg.js'),
+                import('./gallery-extractors/imgbox.js'),
+                import('./gallery-extractors/civitai.js'),
+                import('./gallery-extractors/dropbox.js'),
+                import('./gallery-extractors/pixiv.js')
+            ]);
+            window.findCharacterGalleryUrls = findCharacterGalleryUrls;
+            window.extractGalleryImages = extractGalleryImages;
+            window.identifyGallerySources = identifyGallerySources;
+            window.debugLog?.('[ModuleLoader] Gallery extractors loaded (on demand)');
+        } catch (err) {
+            _extractorsLoaded = false;
+            console.warn('[ModuleLoader] Could not load gallery extractors:', err);
+        }
+    }
+    window.ensureExtractorsLoaded = ensureExtractorsLoaded;
+
+    // NX: Providers online (ChubAI, JanitorAI, CharacterTavern, Pygmalion, Wyvern,
+    // DataCat, Botbooru) desactivados a propósito en este fork. ProviderRegistry se
+    // deja inicializado pero vacío porque otras partes del código la consultan
+    // (indicadores de enlace, taglines, etc.) y esperan que exista, aunque no
+    // devuelva providers.
+    {
+        try {
+            await ProviderRegistry.initProviders(CoreAPI);
+        } catch (err) {
+            console.warn('[ModuleLoader] Provider initialization error:', err);
+        }
+        window.ProviderRegistry = ProviderRegistry;
+        window.closeActiveBrowseDropdowns = ProviderRegistry.closeActiveBrowseDropdowns;
+        window.debugLog?.('[ModuleLoader] Online providers disabled (NX fork)');
+    }
+
+    // NX: "Carpetas" tab — character folders (ported from CTM, no PIN) + native
+    // SillyTavern tag manager. Reuses the old Online view's mount points.
+    try {
+        loadModuleCSS('./organize.css');
+        const organizeModule = await import('./organize.js');
+        ModuleLoader.register('organize', organizeModule.default);
+        window.OrganizeModule = organizeModule.default;
+        // Note: grouping the native ST character list by folder is handled by
+        // index.js now (runs continuously in the main ST page), not from here.
+    } catch (err) {
+        console.warn('[ModuleLoader] Could not load organize module:', err);
+    }
+
+    // ============================
+    // TIER 2 - Lazy modules
+    // ============================
+
+    setupLazyBatchTagging();
+    setupLazyBatchTransfer();
+    loadModuleCSS('./chats.css');
+    setupLazyChats();
+
+    // Initialize all Tier 1 modules
+    await ModuleLoader.initAll(dependencies);
+
+    window.debugLog?.('[ModuleLoader] Module system ready');
+}
+
+
+// ========================================
+// LAZY: BATCH TAGGING
+// ========================================
+
+function setupLazyBatchTagging() {
+    ModuleLoader._registerLazy('batch-tagging', async () => {
+        const mod = await import('./batch-tagging.js');
+        loadModuleCSS('./batch-tagging.css');
+        ModuleLoader.register('batch-tagging', mod.default);
+        await mod.default.init({});
+        mod.default._mlInitDone = true;
+        window.debugLog?.('[ModuleLoader] Lazy-loaded batch-tagging');
+    });
+}
+
+
+// ========================================
+// LAZY: BATCH TRANSFER (bundle export/import)
+// ========================================
+
+function setupLazyBatchTransfer() {
+    ModuleLoader._registerLazy('batch-transfer', async () => {
+        const mod = await import('./batch-transfer.js');
+        loadModuleCSS('./batch-transfer.css');
+        ModuleLoader.register('batch-transfer', mod.default);
+        await mod.default.init({});
+        mod.default._mlInitDone = true;
+        window.debugLog?.('[ModuleLoader] Lazy-loaded batch-transfer');
+    });
+
+    // library.js's import modal routes dropped .zip bundles here
+    window.openBatchImportReview = (...args) =>
+        ModuleLoader.ensureLoaded('batch-transfer').then(mod => mod?.openImportReview?.(...args));
+}
+
+
+// ========================================
+// LAZY: CHATS
+// ========================================
+
+function setupLazyChats() {
+    const { createStub } = createLazyBridgeGroup(
+        () => import('./chats.js'),
+        (mod) => {
+            const chats = mod.default;
+            ModuleLoader.register('chats', chats);
+            chats.init({});
+            chats._mlInitDone = true;
+
+            window.chatsModule = {
+                fetchCharacterChats: chats.fetchCharacterChats,
+                createNewChat: chats.createNewChat,
+                loadAllChats: chats.loadAllChats,
+                renderChats: chats.renderChats,
+                clearChatCache: chats.clearChatCache,
+                openChatPreview: chats.openChatPreview,
+                setChatBoundWorld: chats.setChatBoundWorld,
+                listCharacterChatsWithMeta: chats.listCharacterChatsWithMeta,
+                listAllChatsWithMeta: chats.listAllChatsWithMeta,
+            };
+
+            window.fetchCharacterChats = chats.fetchCharacterChats;
+            window.createNewChat = chats.createNewChat;
+
+            window.debugLog?.('[ModuleLoader] Lazy-loaded chats');
+        }
+    );
+
+    const chatStub = (method) => createStub(() => window.chatsModule?.[method]);
+
+    window.chatsModule = {
+        fetchCharacterChats: chatStub('fetchCharacterChats'),
+        createNewChat: chatStub('createNewChat'),
+        loadAllChats: chatStub('loadAllChats'),
+        renderChats: chatStub('renderChats'),
+        clearChatCache: chatStub('clearChatCache'),
+        openChatPreview: chatStub('openChatPreview'),
+        setChatBoundWorld: chatStub('setChatBoundWorld'),
+        listCharacterChatsWithMeta: chatStub('listCharacterChatsWithMeta'),
+        listAllChatsWithMeta: chatStub('listAllChatsWithMeta'),
+    };
+
+    window.fetchCharacterChats = chatStub('fetchCharacterChats');
+    window.createNewChat = chatStub('createNewChat');
+}
+
+
+// ========================================
+// EXPOSE & BOOTSTRAP
+// ========================================
+
+window.ModuleLoader = ModuleLoader;
+
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initModuleSystem);
+} else {
+    setTimeout(initModuleSystem, 100);
+}

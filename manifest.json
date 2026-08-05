@@ -1,0 +1,7 @@
+{
+    "display_name": "NX Character Hub",
+    "author": "Anonymous (fork of Sillyanonymous/SillyTavern-CharacterLibrary)",
+    "version": "0.1.0",
+    "description": "Editor de personajes en pestaña aparte + carpetas de personajes + carpetas de tags con icono. Fork de Character Library sin proveedores online.",
+    "js": "index.js"
+}

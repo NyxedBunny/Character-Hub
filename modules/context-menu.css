@@ -1,0 +1,149 @@
+/* ========================================
+   Context Menu Styles
+   ======================================== */
+
+.cl-context-menu {
+    display: none;
+    position: fixed;
+    background: var(--cl-glass-bg);
+    backdrop-filter: blur(16px);
+    border: 1px solid rgba(var(--accent-rgb), 0.2);
+    border-radius: var(--radius-2xl);
+    box-shadow:
+        var(--cl-shadow-xl),
+        0 0 40px rgba(0, 0, 0, 0.3),
+        inset 0 1px 0 rgba(255, 255, 255, 0.05);
+    z-index: 10000;
+    min-width: 200px;
+    max-height: calc(100vh - 20px);
+    overflow-y: auto;
+    padding: 5px;
+    opacity: 0;
+    transform: scale(0.97);
+    transform-origin: top left;
+    transition: opacity 0.08s ease-out, transform 0.08s ease-out;
+}
+
+.cl-context-menu.visible {
+    display: block;
+    animation: clContextMenuSlide 0.15s ease forwards;
+}
+
+@keyframes clContextMenuSlide {
+    to {
+        opacity: 1;
+        transform: scale(1);
+    }
+}
+
+.cl-context-menu-item {
+    padding: 7px 12px;
+    cursor: pointer;
+    border-radius: var(--radius-md);
+    transition: background 0.03s;
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm-md);
+    color: var(--cl-text-primary);
+    font-size: var(--font-sm);
+    user-select: none;
+}
+
+.cl-context-menu-item i {
+    width: 16px;
+    text-align: center;
+    opacity: 0.8;
+    font-size: var(--font-sm);
+}
+
+.cl-context-menu-item:hover {
+    background: rgba(var(--accent-rgb), 0.2);
+}
+
+.cl-context-menu-item:hover i {
+    opacity: 1;
+}
+
+.cl-context-menu-item.danger {
+    color: var(--cl-danger-text);
+}
+
+.cl-context-menu-item.danger:hover {
+    background: rgba(var(--cl-error-rgb), 0.25);
+}
+
+.cl-context-menu-item.secondary {
+    color: var(--cl-text-secondary);
+}
+
+.cl-context-menu-item.secondary:hover {
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.cl-context-menu-item.disabled {
+    opacity: 0.5;
+    pointer-events: none;
+}
+
+.cl-context-menu-separator {
+    height: 1px;
+    background: var(--cl-border);
+    margin: 4px 0;
+}
+
+.cl-context-menu-header {
+    padding: 8px 14px;
+    font-size: var(--font-2xs);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--cl-text-secondary);
+    font-weight: 600;
+}
+
+/* ========================================
+   Mobile Overrides
+   ======================================== */
+/* Desktop context menu hidden on mobile (replaced by bottom sheet) */
+html.cl-mobile .cl-context-menu {
+    display: none !important;
+}
+
+/* Context-menu items cloned into the canonical .mobile-sheet bottom drawer
+   (the sheet shell, slide, handle + scrim all come from .mobile-sheet). */
+html.cl-mobile .mobile-sheet .cl-context-menu-separator {
+    height: 1px;
+    background: var(--glass-border);
+    margin: 4px 12px;
+}
+html.cl-mobile .mobile-sheet .cl-context-menu-header {
+    padding: 10px 20px 6px;
+    font-size: var(--font-2xs);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-secondary, #999);
+    font-weight: 600;
+}
+html.cl-mobile .mobile-sheet .cl-context-menu-item {
+    display: flex;
+    align-items: center;
+    gap: var(--space-md);
+    padding: 14px 20px;
+    min-height: 48px;
+    font-size: var(--font-md);
+    color: var(--text-primary, #eee);
+    cursor: pointer;
+    border-radius: 0;
+    transition: background 0.15s;
+}
+html.cl-mobile .mobile-sheet .cl-context-menu-item:active {
+    background: rgba(255,255,255,0.08);
+}
+html.cl-mobile .mobile-sheet .cl-context-menu-item i {
+    width: 22px;
+    text-align: center;
+    opacity: 0.8;
+    font-size: var(--font-base);
+}
+html.cl-mobile .mobile-sheet .cl-context-menu-item.danger {
+    color: var(--cl-danger-text);
+}

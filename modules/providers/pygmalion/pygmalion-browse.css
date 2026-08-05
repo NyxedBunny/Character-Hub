@@ -1,0 +1,77 @@
+/* ============================================
+   Pygmalion Browse CSS
+   Extracted from library.css
+   ============================================ */
+
+
+#pygFollowAuthorBtn {
+    background: linear-gradient(135deg, rgba(var(--cl-error-bright-rgb), 0.2), rgba(var(--cl-error-bright-darker-rgb), 0.2));
+    border: 1px solid rgba(var(--cl-error-bright-rgb), 0.4);
+    color: var(--cl-error-bright);
+    padding: 6px 12px;
+    font-size: var(--font-md);
+}
+
+#pygFollowAuthorBtn:hover:not(:disabled) {
+    background: linear-gradient(135deg, rgba(var(--cl-error-bright-rgb), 0.3), rgba(var(--cl-error-bright-darker-rgb), 0.3));
+    border-color: rgba(var(--cl-error-bright-rgb), 0.6);
+}
+
+#pygFollowAuthorBtn.following {
+    background: linear-gradient(135deg, rgba(var(--cl-error-bright-rgb), 0.4), rgba(var(--cl-error-bright-darker-rgb), 0.4));
+    color: #fff;
+}
+
+#pygFollowAuthorBtn:disabled {
+    opacity: 0.6;
+    cursor: wait;
+}
+
+/* Pygmalion Login - plugin status & auth status */
+
+.pyg-plugin-status {
+    font-size: var(--font-md);
+    margin-bottom: 12px;
+    line-height: 1.5;
+}
+
+.pyg-plugin-status a {
+    color: var(--accent);
+}
+
+.pyg-auth-status {
+    background: rgba(var(--cl-success-bright-rgb), 0.1);
+    border: 1px solid rgba(var(--cl-success-bright-rgb), 0.2);
+    border-radius: var(--radius-lg);
+    padding: 12px 15px;
+    margin-bottom: 16px;
+    font-size: var(--font-md);
+    line-height: 1.5;
+}
+
+.pyg-login-disabled {
+    opacity: 0.5;
+    pointer-events: none;
+}
+
+.pyg-manual-token-section {
+    margin-top: 15px;
+    background: rgba(255, 255, 255, 0.03);
+    padding: 10px;
+    border-radius: var(--radius-lg);
+}
+
+.pyg-manual-token-section > summary {
+    cursor: pointer;
+    color: var(--text-secondary);
+    font-size: var(--font-md);
+}
+
+.pyg-manual-token-section > summary:hover {
+    color: var(--accent);
+}
+
+
+/* Mobile overrides */
+
+html.cl-mobile .pyg-plugin-status { font-size: var(--font-sm); }

@@ -1,0 +1,760 @@
+import * as CoreAPI from './core-api.js';
+
+function copyToClipboard(text) {
+    if (navigator.clipboard?.writeText) {
+        return navigator.clipboard.writeText(text);
+    }
+    return new Promise((resolve, reject) => {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.style.position = 'fixed';
+        textarea.style.left = '-9999px';
+        document.body.appendChild(textarea);
+        textarea.focus();
+        textarea.select();
+        try {
+            document.execCommand('copy') ? resolve() : reject(new Error('execCommand failed'));
+        } catch (e) { reject(e); }
+        finally { document.body.removeChild(textarea); }
+    });
+}
+
+let isInitialized = false;
+let menuElement = null;
+let currentCharacter = null;
+let currentCard = null;
+
+export function init(deps) {
+    if (isInitialized) {
+        console.warn('[ContextMenu] Already initialized');
+        return;
+    }
+    
+    createMenu();
+    setupGlobalListeners();
+
+    window.registerOverlay?.({
+        id: 'clContextMenu',
+        tier: 8,
+        close: () => hide(),
+        visible: (el) => el.classList.contains('visible'),
+    });
+
+    // Bulk delete confirm (dynamic). Tier 7 so it closes before charModal on back/Escape.
+    window.registerOverlay?.({ id: 'bulkDeleteConfirmModal', tier: 7, static: false, close: (el) => el?.remove() });
+
+    isInitialized = true;
+    CoreAPI.debugLog('[ContextMenu] Module initialized');
+}
+
+function createMenu() {
+    menuElement = document.createElement('div');
+    menuElement.id = 'clContextMenu';
+    menuElement.className = 'cl-context-menu';
+    document.body.appendChild(menuElement);
+}
+
+function setupGlobalListeners() {
+    document.addEventListener('click', (e) => {
+        if (!menuElement.contains(e.target)) {
+            hide();
+        }
+    });
+    
+    document.addEventListener('scroll', () => hide(), true);
+
+    document.addEventListener('cl-extensions-recovered', () => {
+        if (menuElement?.classList.contains('visible') && currentCharacter) {
+            const menuItems = buildMenuItems(currentCharacter, currentCard);
+            renderMenu(menuItems);
+        }
+    });
+    
+    // Use event delegation for context menu on character cards
+    // This works even for cards created before module loaded
+    document.addEventListener('contextmenu', (e) => {
+        const card = e.target.closest('.char-card');
+        if (card) {
+            const avatar = card.dataset.avatar;
+            if (avatar) {
+                const char = CoreAPI.getCharacterByAvatar(avatar);
+                if (char) {
+                    show(e, char, card);
+                }
+            }
+        }
+    });
+}
+
+export function show(event, char, cardElement) {
+    event.preventDefault();
+    event.stopPropagation();
+    
+    currentCharacter = char;
+    currentCard = cardElement;
+    
+    const menuItems = buildMenuItems(char, cardElement);
+    renderMenu(menuItems);
+    
+    // Force layout for measurement
+    menuElement.style.visibility = 'hidden';
+    menuElement.classList.add('visible');
+    
+    positionMenu(event.clientX, event.clientY);
+    
+    menuElement.style.visibility = '';
+}
+
+export function hide() {
+    menuElement.classList.remove('visible');
+    currentCharacter = null;
+    currentCard = null;
+}
+
+function buildMenuItems(char, cardElement) {
+    const isSelected = CoreAPI.isCharacterSelected(char.avatar);
+    const selectionCount = CoreAPI.getSelectionCount();
+    
+    if (isSelected && selectionCount > 1) {
+        return buildBulkMenuItems(selectionCount);
+    }
+    
+    return buildSingleMenuItems(char, cardElement);
+}
+
+function buildBulkMenuItems(count) {
+    const items = [];
+    
+    items.push({
+        type: 'header',
+        label: `${count} Characters Selected`
+    });
+    
+    // Bulk edit tags
+    items.push({
+        icon: 'fa-solid fa-tags',
+        label: 'Edit Tags',
+        action: () => {
+            const batchTagging = CoreAPI.getModule('batch-tagging');
+            if (batchTagging?.openModal) {
+                batchTagging.openModal();
+            }
+        }
+    });
+    
+    // Bulk check for updates (provider-linked only)
+    items.push({
+        icon: 'fa-solid fa-arrows-rotate',
+        label: 'Check for Updates',
+        action: () => {
+            const cardUpdates = CoreAPI.getModule('card-updates');
+            if (cardUpdates?.checkSelectedCharacters) {
+                cardUpdates.checkSelectedCharacters();
+            }
+        }
+    });
+
+    // Bulk add to playlist
+    items.push({
+        icon: 'fa-solid fa-list-ul',
+        label: 'Add to Playlist',
+        action: () => {
+            const avatars = CoreAPI.getSelectedCharacters().map(c => c.avatar);
+            if (avatars.length) CoreAPI.openPlaylistPicker(avatars);
+        }
+    });
+    
+    items.push({ type: 'separator' });
+    
+    // Bulk favorite actions
+    items.push({
+        icon: 'fa-solid fa-star',
+        label: 'Add All to Favorites',
+        action: () => bulkToggleFavorites(true)
+    });
+    
+    items.push({
+        icon: 'fa-regular fa-star',
+        label: 'Remove All from Favorites',
+        action: () => bulkToggleFavorites(false)
+    });
+    
+    items.push({ type: 'separator' });
+    
+    // Bulk export
+    items.push({
+        icon: 'fa-solid fa-download',
+        label: 'Export All',
+        action: () => bulkExport()
+    });
+    
+    items.push({ type: 'separator' });
+    
+    // Bulk delete (danger)
+    items.push({
+        icon: 'fa-solid fa-trash',
+        label: 'Delete All',
+        className: 'danger',
+        action: () => bulkDelete()
+    });
+    
+    items.push({ type: 'separator' });
+    
+    // Selection management
+    items.push({
+        icon: 'fa-solid fa-xmark',
+        label: 'Clear Selection',
+        className: 'secondary',
+        action: () => CoreAPI.clearSelection()
+    });
+    
+    return items;
+}
+
+function buildSingleMenuItems(char, cardElement) {
+    const isFavorite = cardElement?.classList.contains('is-favorite') || 
+                       char.fav === true || 
+                       char.fav === 'true';
+    
+    const isSelected = CoreAPI.isCharacterSelected(char.avatar);
+    const multiSelectEnabled = CoreAPI.isMultiSelectEnabled();
+    
+    // Check for provider link (provider-agnostic)
+    const providerMatch = CoreAPI.getCharacterProvider(char);
+    const provider = providerMatch?.provider || null;
+    const linkInfo = providerMatch?.linkInfo || null;
+    
+    const items = [];
+    
+    items.push({
+        type: 'header',
+        label: CoreAPI.truncate(CoreAPI.getCharacterName(char) || 'Character', 25)
+    });
+    
+    items.push({
+        icon: 'fa-solid fa-expand',
+        label: 'Open Character',
+        action: () => CoreAPI.openCharacterModal(char)
+    });
+    
+    items.push({
+        icon: isFavorite ? 'fa-solid fa-star' : 'fa-regular fa-star',
+        label: isFavorite ? 'Remove from Favorites' : 'Add to Favorites',
+        action: () => toggleFavorite(char)
+    });
+    
+    items.push({ type: 'separator' });
+    
+    // Selection toggle (always show, enables quick selection)
+    items.push({
+        icon: isSelected ? 'fa-solid fa-square-minus' : 'fa-solid fa-square-check',
+        label: isSelected ? 'Deselect' : 'Select for Batch',
+        action: () => {
+            // Enable multi-select if not already
+            if (!multiSelectEnabled) {
+                CoreAPI.enableMultiSelect();
+            }
+            CoreAPI.toggleCharacterSelection(char, cardElement);
+        }
+    });
+    
+    // Provider link
+    if (provider && linkInfo) {
+        items.push({
+            icon: 'fa-solid fa-link',
+            label: `${provider.name} Info`,
+            action: () => provider.openLinkUI(char)
+        });
+        
+        // Check for updates
+        items.push({
+            icon: 'fa-solid fa-arrows-rotate',
+            label: 'Check for Updates',
+            action: () => {
+                const cardUpdates = CoreAPI.getModule('card-updates');
+                if (cardUpdates?.checkSingleCharacter) {
+                    cardUpdates.checkSingleCharacter(char);
+                }
+            }
+        });
+    } else if (CoreAPI.isExtensionsRecoveryInProgress()) {
+        // Extensions not yet recovered - provider link status unknown
+        items.push({
+            icon: 'fa-solid fa-spinner fa-spin',
+            label: 'Loading provider data…',
+            disabled: true
+        });
+    } else {
+        // Unlinked - single entry that opens the global link modal (searches all providers)
+        items.push({
+            icon: 'fa-solid fa-link',
+            label: 'Link to Provider',
+            action: () => CoreAPI.openProviderLinkModal(char)
+        });
+    }
+    
+    // Version history (available for ALL characters - local snapshots + remote if provider-linked)
+    items.push({
+        icon: 'fa-solid fa-clock-rotate-left',
+        label: 'Version History',
+        action: () => {
+            const charVersions = CoreAPI.getModule('character-versions');
+            if (charVersions?.openVersionHistory) {
+                charVersions.openVersionHistory(char);
+            }
+        }
+    });
+    
+    // Gallery viewer
+    items.push({
+        icon: 'fa-solid fa-images',
+        label: 'View Gallery',
+        action: () => {
+            const galleryViewer = CoreAPI.getModule('gallery-viewer');
+            if (galleryViewer?.openViewer) {
+                galleryViewer.openViewer(char);
+            }
+        }
+    });
+    
+    items.push({ type: 'separator' });
+    
+    // Utility actions
+    items.push({
+        icon: 'fa-solid fa-list-ul',
+        label: 'Add to Playlist',
+        action: () => CoreAPI.openPlaylistPicker([char.avatar])
+    });
+
+    items.push({
+        icon: 'fa-solid fa-download',
+        label: 'Export Character',
+        action: () => exportCharacter(char)
+    });
+    
+    items.push({ type: 'separator' });
+    
+    // Danger zone
+    items.push({
+        icon: 'fa-solid fa-trash',
+        label: 'Delete Character',
+        className: 'danger',
+        action: () => confirmDelete(char)
+    });
+    
+    return items;
+}
+
+function renderMenu(items) {
+    menuElement.innerHTML = items.map(item => {
+        if (item.type === 'separator') {
+            return '<div class="cl-context-menu-separator"></div>';
+        }
+        
+        if (item.type === 'header') {
+            return `<div class="cl-context-menu-header">${escapeHtml(item.label)}</div>`;
+        }
+        
+        const className = `cl-context-menu-item ${item.className || ''} ${item.disabled ? 'disabled' : ''}`;
+        return `
+            <div class="${className}" data-action="${item.label}">
+                <i class="${item.icon}"></i>
+                <span>${escapeHtml(item.label)}</span>
+            </div>
+        `;
+    }).join('');
+    
+    menuElement.querySelectorAll('.cl-context-menu-item:not(.disabled)').forEach((el, index) => {
+        const item = items.filter(i => i.type !== 'separator' && i.type !== 'header' && !i.disabled)[index];
+        if (item?.action) {
+            el.addEventListener('click', () => {
+                hide();
+                item.action();
+            });
+        }
+    });
+}
+
+function positionMenu(x, y) {
+    const zoom = parseFloat(document.body.style.zoom) || 1;
+    x /= zoom;
+    y /= zoom;
+
+    menuElement.style.left = '0';
+    menuElement.style.top = '0';
+    
+    const rawMenuRect = menuElement.getBoundingClientRect();
+    const menuWidth = rawMenuRect.width / zoom;
+    const menuHeight = rawMenuRect.height / zoom;
+    const vw = window.innerWidth / zoom;
+    const vh = window.innerHeight / zoom;
+    const pad = 10;
+    
+    let finalX = x;
+    if (x + menuWidth + pad > vw) finalX = x - menuWidth;
+    if (finalX < pad) finalX = pad;
+    
+    const spaceBelow = vh - y;
+    const spaceAbove = y;
+    const openUpward = menuHeight + pad > spaceBelow && spaceAbove > spaceBelow;
+    
+    let finalY;
+    if (openUpward) {
+        finalY = Math.max(pad, y - menuHeight);
+        menuElement.style.transformOrigin = 'bottom left';
+    } else {
+        finalY = y;
+        if (finalY + menuHeight + pad > vh) finalY = vh - menuHeight - pad;
+        if (finalY < pad) finalY = pad;
+        menuElement.style.transformOrigin = 'top left';
+    }
+    
+    menuElement.style.left = `${finalX}px`;
+    menuElement.style.top = `${finalY}px`;
+}
+
+async function toggleFavorite(char) {
+    // Canonical toggle: write + ST same-tick sync + grid badge + favorites-filter refresh + toasts.
+    await CoreAPI.toggleCharacterFavorite(char);
+}
+
+async function bulkToggleFavorites(setFavorite) {
+    const selected = CoreAPI.getSelectedCharacters();
+    if (selected.length === 0) return;
+
+    let successCount = 0;
+    let failCount = 0;
+
+    CoreAPI.showToast(`Updating ${selected.length} characters...`, 'info');
+
+    for (const char of selected) {
+        try {
+            const success = await CoreAPI.applyCardFieldUpdates(char.avatar, {
+                'extensions.fav': setFavorite,
+            });
+            if (success) {
+                char.fav = setFavorite;
+                CoreAPI.updateCharacterCardFavoriteStatus(char.avatar, setFavorite);
+                successCount++;
+            } else {
+                failCount++;
+            }
+        } catch (err) {
+            console.error('[ContextMenu] Bulk favorite failed for:', char.name, err);
+            failCount++;
+        }
+    }
+    
+    if (failCount === 0) {
+        CoreAPI.showToast(`${setFavorite ? 'Added' : 'Removed'} ${successCount} favorites`, 'success');
+    } else {
+        CoreAPI.showToast(`Updated ${successCount}, failed ${failCount}`, 'warning');
+    }
+
+    // Bulk-unfavoriting under the favorites filter strands stale cards in the grid otherwise.
+    if (!setFavorite && CoreAPI.getActiveFilterState().fav) CoreAPI.performSearch();
+}
+
+// Fetch a character's PNG and save it via the shared anchor-download; throws on a failed fetch.
+async function downloadCharacterPng(char) {
+    const response = await fetch(`/characters/${encodeURIComponent(char.avatar)}`);
+    if (!response.ok) throw new Error('Failed to fetch character file');
+    CoreAPI.downloadBlobAsFile(await response.blob(), char.name ? `${char.name}.png` : char.avatar);
+}
+
+async function bulkExport() {
+    const selected = CoreAPI.getSelectedCharacters();
+    if (selected.length === 0) return;
+
+    if (CoreAPI.getSetting('exportAsLinks')) {
+        return bulkExportLinks(selected);
+    }
+    return bulkExportPngs(selected);
+}
+
+async function bulkExportPngs(selected = null) {
+    selected = selected || CoreAPI.getSelectedCharacters();
+    if (selected.length === 0) return;
+
+    CoreAPI.showToast(`Exporting ${selected.length} characters...`, 'info');
+
+    let successCount = 0;
+
+    for (const char of selected) {
+        try {
+            await downloadCharacterPng(char);
+            successCount++;
+            // Small delay between downloads to not overwhelm browser
+            await new Promise(r => setTimeout(r, 200));
+        } catch (err) {
+            console.error('[ContextMenu] Export failed for:', char.name, err);
+        }
+    }
+
+    CoreAPI.showToast(`Exported ${successCount}/${selected.length} characters`, 'success');
+}
+
+function bulkExportLinks(selected = null) {
+    selected = selected || CoreAPI.getSelectedCharacters();
+    if (selected.length === 0) return;
+    const links = [];
+    let skipped = 0;
+    for (const char of selected) {
+        const match = CoreAPI.getCharacterProvider(char);
+        if (match) {
+            const url = match.provider.getCharacterUrl?.(match.linkInfo);
+            if (url) { links.push(url); continue; }
+        }
+        skipped++;
+    }
+    if (links.length === 0) {
+        CoreAPI.showToast('No linked characters to export', 'warning');
+        return;
+    }
+    copyToClipboard(links.join('\n')).then(() => {
+        let msg = `${links.length} link${links.length !== 1 ? 's' : ''} copied to clipboard`;
+        if (skipped > 0) msg += ` (${skipped} unlinked skipped)`;
+        CoreAPI.showToast(msg, 'success');
+    }).catch(() => {
+        CoreAPI.showToast('Failed to copy to clipboard', 'error');
+    });
+}
+
+async function bulkDelete() {
+    const selected = CoreAPI.getSelectedCharacters();
+    if (selected.length === 0) return;
+    
+    // Check which characters have gallery images AND unique gallery IDs
+    // Only offer gallery deletion when unique folders feature is ENABLED
+    const uniqueFoldersEnabled = CoreAPI.getSetting('uniqueGalleryFolders') || false;
+
+    // gallery_id sits in extensions; a fresh load hasnt recovered them yet
+    if (CoreAPI.isExtensionsRecoveryInProgress()) {
+        await Promise.all(selected.map(c => CoreAPI.hydrateCharacter(c).catch(() => {})));
+    }
+
+    const galleryInfos = await Promise.all(
+        selected.map(async char => ({
+            char,
+            info: await CoreAPI.getCharacterGalleryInfo(char),
+            hasUniqueGallery: !!CoreAPI.getCharacterGalleryId(char)
+        }))
+    );
+    
+    // Only count characters with unique galleries for deletion option (when feature is enabled)
+    const charsWithUniqueGallery = uniqueFoldersEnabled 
+        ? galleryInfos.filter(g => g.info.count > 0 && g.hasUniqueGallery)
+        : [];
+    const charsWithSharedGallery = galleryInfos.filter(g => g.info.count > 0 && (!g.hasUniqueGallery || !uniqueFoldersEnabled));
+    const totalUniqueGalleryFiles = charsWithUniqueGallery.reduce((sum, g) => sum + g.info.count, 0);
+    
+    const names = selected.slice(0, 5).map(c => CoreAPI.escapeHtml(CoreAPI.getCharacterName(c))).join(', ');
+    const andMore = selected.length > 5 ? ` and ${selected.length - 5} more` : '';
+    
+    const modal = document.createElement('div');
+    modal.className = 'confirm-modal cl-modal-drawer';
+    modal.id = 'bulkDeleteConfirmModal';
+    modal.innerHTML = `
+        <div class="confirm-modal-content" style="max-width: calc(480px * var(--modal-scale, 1));">
+            <div class="confirm-modal-header" style="background: linear-gradient(135deg, rgba(var(--cl-error-bright-rgb), 0.2) 0%, rgba(var(--cl-error-bright-darker-rgb), 0.2) 100%);">
+                <h3 style="border: none; padding: 0; margin: 0;">
+                    <i class="fa-solid fa-triangle-exclamation" style="color: var(--cl-error-bright);"></i>
+                    Delete ${selected.length} Characters
+                </h3>
+                <button class="close-confirm-btn" id="closeBulkDeleteModal">&times;</button>
+            </div>
+            <div class="confirm-modal-body">
+                <p style="color: var(--text-secondary); margin-bottom: 15px;">
+                    <strong>${names}</strong>${andMore}
+                </p>
+                
+                ${totalUniqueGalleryFiles > 0 ? `
+                    <div style="background: rgba(241, 196, 15, 0.15); border: 1px solid rgba(241, 196, 15, 0.4); border-radius: var(--radius-lg); padding: 12px; margin-bottom: 15px;">
+                        <div style="display: flex; align-items: center; gap: 8px; color: var(--cl-warning-bright); margin-bottom: 10px;">
+                            <i class="fa-solid fa-images"></i>
+                            <strong>${charsWithUniqueGallery.length} character${charsWithUniqueGallery.length !== 1 ? 's have' : ' has'} unique gallery files (${totalUniqueGalleryFiles} total)</strong>
+                        </div>
+                        <div style="display: flex; flex-direction: column; gap: 8px;">
+                            <label style="display: flex; align-items: center; gap: 10px; cursor: pointer; color: var(--text-primary); padding: 8px; border-radius: var(--radius-md); background: rgba(0,0,0,0.2);">
+                                <input type="radio" name="galleryAction" value="keep" checked>
+                                <span><strong>Keep gallery files</strong> - Leave in folders</span>
+                            </label>
+                            <label style="display: flex; align-items: center; gap: 10px; cursor: pointer; color: var(--text-primary); padding: 8px; border-radius: var(--radius-md); background: rgba(0,0,0,0.2);">
+                                <input type="radio" name="galleryAction" value="delete">
+                                <span><strong>Delete gallery files</strong> - Remove all images</span>
+                            </label>
+                        </div>
+                    </div>
+                ` : ''}
+                
+                ${charsWithSharedGallery.length > 0 ? `
+                    <div style="background: rgba(150, 150, 150, 0.15); border: 1px solid rgba(150, 150, 150, 0.4); border-radius: var(--radius-lg); padding: 10px; margin-bottom: 15px; font-size: 13px;">
+                        <i class="fa-solid fa-info-circle" style="color: var(--text-faint);"></i>
+                        <span style="color: var(--text-secondary);">${charsWithSharedGallery.length} character${charsWithSharedGallery.length !== 1 ? 's have' : ' has'} shared galleries (files will be kept)</span>
+                    </div>
+                ` : ''}
+                
+                <p style="color: var(--text-secondary);">
+                    <i class="fa-solid fa-exclamation-circle" style="color: var(--cl-error-bright);"></i>
+                    This action cannot be undone!
+                </p>
+            </div>
+            <div class="confirm-modal-footer">
+                <button class="action-btn secondary" id="cancelBulkDeleteBtn">
+                    <i class="fa-solid fa-xmark"></i> Cancel
+                </button>
+                <button class="action-btn danger" id="confirmBulkDeleteBtn">
+                    <i class="fa-solid fa-trash"></i> Delete All
+                </button>
+            </div>
+        </div>
+    `;
+    
+    document.body.appendChild(modal);
+    
+    // Event handlers
+    const closeModal = () => modal.remove();
+    
+    modal.querySelector('#closeBulkDeleteModal').addEventListener('click', closeModal);
+    modal.querySelector('#cancelBulkDeleteBtn').addEventListener('click', closeModal);
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) closeModal();
+    });
+    
+    modal.querySelector('#confirmBulkDeleteBtn').addEventListener('click', async () => {
+        const confirmBtn = modal.querySelector('#confirmBulkDeleteBtn');
+        const galleryAction = modal.querySelector('input[name="galleryAction"]:checked')?.value || 'keep';
+        
+        confirmBtn.disabled = true;
+        confirmBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Deleting...';
+        
+        let successCount = 0;
+        let failCount = 0;
+        let galleryDeleted = 0;
+        
+        for (let i = 0; i < selected.length; i++) {
+            const char = selected[i];
+            const galleryData = galleryInfos.find(g => g.char.avatar === char.avatar);
+            
+            confirmBtn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> ${i + 1}/${selected.length}...`;
+            
+            try {
+                // Delete gallery files if requested AND character has unique gallery
+                if (galleryAction === 'delete' && galleryData?.hasUniqueGallery && galleryData?.info?.count > 0) {
+                    const safeFolderName = CoreAPI.sanitizeFolderName(galleryData.info.folder);
+                    for (const fileName of galleryData.info.files) {
+                        try {
+                            const deletePath = `/user/images/${safeFolderName}/${fileName}`;
+                            await CoreAPI.apiRequest('/images/delete', 'POST', { path: deletePath });
+                            galleryDeleted++;
+                        } catch (e) {
+                            // Continue even if image deletion fails
+                        }
+                    }
+                }
+                
+                const response = await CoreAPI.apiRequest('/characters/delete', 'POST', {
+                    avatar_url: char.avatar,
+                    delete_chats: false
+                });
+                
+                if (response.ok) {
+                    CoreAPI.playlistsOnCharDeleted(char.avatar);
+                    
+                    const card = CoreAPI.findCardElement(char.avatar);
+                    card?.remove();
+                    successCount++;
+                } else {
+                    failCount++;
+                }
+            } catch (err) {
+                console.error('[ContextMenu] Delete failed for:', char.name, err);
+                failCount++;
+            }
+        }
+        
+        closeModal();
+        CoreAPI.clearSelection();
+        
+        let message = `Deleted ${successCount} character${successCount !== 1 ? 's' : ''}`;
+        if (galleryDeleted > 0) {
+            message += ` and ${galleryDeleted} gallery file${galleryDeleted !== 1 ? 's' : ''}`;
+        }
+        if (failCount > 0) {
+            message += `, ${failCount} failed`;
+            CoreAPI.showToast(message, 'warning');
+        } else {
+            CoreAPI.showToast(message, 'success');
+        }
+        
+        // Sync main ST window's character list
+        try {
+            const host = CoreAPI.getHostWindow();
+            if (host) {
+                const context = host.SillyTavern?.getContext?.();
+                if (context?.getCharacters) {
+                    await context.getCharacters();
+                }
+            }
+        } catch (e) {
+            console.warn('[ContextMenu] Could not sync main window:', e);
+        }
+        
+        // Force refresh character list from server
+        await CoreAPI.refreshCharacters(true);
+    });
+}
+
+async function exportCharacter(char) {
+    if (CoreAPI.getSetting('exportAsLinks')) {
+        const match = CoreAPI.getCharacterProvider(char);
+        if (match) {
+            const url = match.provider.getCharacterUrl?.(match.linkInfo);
+            if (url) {
+                copyToClipboard(url).then(() => {
+                    CoreAPI.showToast('Link copied to clipboard', 'success');
+                }).catch(() => {
+                    CoreAPI.showToast('Failed to copy to clipboard', 'error');
+                });
+                return;
+            }
+        }
+        CoreAPI.showToast('Character has no provider link — exporting PNG', 'info');
+    }
+
+    try {
+        await downloadCharacterPng(char);
+        CoreAPI.showToast('Character exported', 'success');
+    } catch (err) {
+        console.error('[ContextMenu] Export failed:', err);
+        CoreAPI.showToast('Failed to export character', 'error');
+    }
+}
+
+// Delegate to the shared single-delete dialog (takes the char directly; no detail-modal detour).
+function confirmDelete(char) {
+    CoreAPI.showDeleteConfirmation(char);
+}
+
+function escapeHtml(text) {
+    return CoreAPI.escapeHtml(text);
+}
+
+export function attachToCard(cardElement, char) {
+    cardElement.addEventListener('contextmenu', (e) => {
+        show(e, char, cardElement);
+    });
+}
+
+export default {
+    init,
+    show,
+    hide,
+    attachToCard,
+    // Bulk actions - exposed for multi-select toolbar + batch-transfer chooser
+    bulkToggleFavorites,
+    bulkExport,
+    bulkExportPngs,
+    bulkExportLinks,
+    bulkDelete
+};

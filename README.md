@@ -1,0 +1,827 @@
+# SillyTavern Character Library
+
+A powerful SillyTavern extension for discovering, organizing, and managing your character library with a modern glassmorphic interface.
+
+> **Note:** This is a hobby project but things mostly work. Expect bugs, use at your own risk.
+
+## Screenshots
+
+![Main Gallery View](https://raw.githubusercontent.com/Sillyanonymous/assets/refs/heads/main/v2_Main.jpg)
+*Browse your character library with search, filtering, and sorting*
+
+![Character Details](https://raw.githubusercontent.com/Sillyanonymous/assets/refs/heads/main/v2_Details.png)
+*View and edit character details, chats, media, and related characters*
+
+![Character Gallery](https://raw.githubusercontent.com/Sillyanonymous/assets/refs/heads/main/v2_Gallery.jpg)
+*Download embedded character media*
+
+![Character Details Expanded views](https://raw.githubusercontent.com/Sillyanonymous/assets/refs/heads/main/v2_creatorsNotes.png)
+*Expand separate views such as Creator's notes*
+
+![Related Characters](https://raw.githubusercontent.com/Sillyanonymous/assets/refs/heads/main/v2_Similar.png)
+*Find potentially related characters*
+
+![ChubAI Integration](https://raw.githubusercontent.com/Sillyanonymous/assets/refs/heads/main/v2_online_tab.jpg)
+*Browse and download characters from online providers*
+
+![Batch Operations](https://raw.githubusercontent.com/Sillyanonymous/assets/refs/heads/main/v2_batchOperations.jpg)
+*Apply changes to any number of selected characters*
+
+![Batch Tagging](https://raw.githubusercontent.com/Sillyanonymous/assets/refs/heads/main/v2_batchTagging.jpg)
+*...Such as Batch tagging*
+
+![Batch Updates](https://raw.githubusercontent.com/Sillyanonymous/assets/refs/heads/main/v2_batchUpdates.jpg)
+*...Batch updates*
+
+![Batch Updates](https://raw.githubusercontent.com/Sillyanonymous/assets/refs/heads/main/v2_batchPlaylists.jpg)
+*...and much more*
+
+## Installation
+
+1. Clone to your SillyTavern extensions folder:
+   ```
+   SillyTavern/data/default-user/extensions/SillyTavern-CharacterLibrary
+   ```
+2. Refresh SillyTavern's page
+3. Click the new Character Library icon in SillyTavern's top bar (to the right of Character Management)
+4. *(Optional)* Switch to **Embedded Panel** mode in the extension settings for an integrated experience (see [Display Modes](#-display-modes))
+5. *(Optional)* For Pygmalion login, CharacterTavern NSFW access, and DataCat browsing, install the [cl-helper plugin](#cl-helper-plugin-not-detected)
+
+
+
+## ✨ Core Features
+
+### 📚 Character Discovery & Organization
+
+- **Grid view** with virtual-scroll and progressive lazy-loading
+- **Search** across name, tags, author, and creator's notes, plus [special search filters](#search-filters)
+- **Tag filtering** with include/exclude/neutral tri-state logic
+- **Sort** by name, last modified, date created, token count, or random
+- **Favorites** filter, with SillyTavern native favorites sync
+- **Card updates** from any linked provider with field-level diffs (single or batch)
+- **Batch tagging** to add or remove tags across multiple characters at once
+- **Multi-select** for batch tagging, favorites, update checks, export, or deletion
+- **Bundle export/import** to move characters between SillyTavern instances in one .zip: cards, chats, gallery folders, and linked lorebooks. Export via multi-select; import by drag & drop into the import dialog
+- **Right-click context menu** on any character card for quick actions
+- **Version history & snapshots** with save/restore, remote version browsing, and full diff preview
+- **Playlists** for organizing characters into named, ordered virtual folders with icons and colors
+- **Filter presets** to save and restore your current filter configuration (tags, sort, search, advanced filters). Open the **Presets** dropdown in the Advanced Filters panel to load, save, rename, or delete presets. Type a name in the input to save the current filter state; click an existing preset to load it. Presets are also available in the **Chats** tab for filtering chat history.
+- **Default Filter Preset** in Settings to auto-apply one preset every time the library opens, so you land in your most-used view without re-applying filters.
+- **Character Creator** with built-in AI Studio for assisted card authoring, brainstorming, and iterative refinement
+- **Lorebook Manager** for browsing, editing, creating, importing, and exporting world files, with AI-assisted entry generation
+- **Custom CSS theming** with snippet management and an AI CSS Assistant that writes and iterates on styling for you
+- **Animated card info** on hover with configurable visibility options
+
+### 🎨 Character Details
+
+Click any character for a **rich tabbed interface**:
+
+| Tab | Description |
+|-----|-------------|
+| **Details** | Rich markdown/HTML/CSS rendering in a secure sandboxed iframe, embedded images, creator notes, alternate greetings, embedded lorebooks |
+| **Edit** | Full character card editor with change tracking and visual diff preview |
+| **Chats** | All conversations with message counts; resume any chat directly |
+| **Gallery** | Images (PNG/JPG/WebP/GIF), video, and audio (MP3/WAV/OGG/M4A) with built-in players. Download embedded media and provider galleries |
+| **Related** | Smart recommendations based on shared tags, creator, and content keywords |
+| **Versions** | Local snapshots and remote version history with diff preview (shown when history exists) |
+| **Info** | Debug/metadata panel for power users (enable in Settings) |
+
+**Detail modal UX:**
+
+- **Edit Lock** prevents accidental changes. The Edit tab opens locked; click **Unlock Editing** to enable field changes
+- **Prev/Next navigation** lets you cycle through the current sort + filter view without returning to the grid. Desktop shows chevron buttons on the sides of the modal; mobile swipes left/right on the modal header. Toggle via Settings, **Card Grid & Browse → Prev/Next navigation in character details** (on by default)
+- **Unsaved-edits confirmation** when you close the modal or navigate to another character with pending edits in the Edit tab. Save success and programmatic closes (e.g. after delete) skip the prompt
+- **Tap-to-scroll on long titles** (mobile): tap a long character name in the modal header or chat preview title to scroll through the full text
+
+---
+
+## 🖥️ Display Modes
+
+Character Library can run in two modes, configurable in SillyTavern's **Extensions** panel under **Character Library**:
+
+| Mode | Description |
+|------|-------------|
+| **New Tab** (default) | Opens in a separate browser tab. |
+| **Embedded Panel** | Runs inside SillyTavern as an overlay panel. |
+
+### Launcher
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| **Show launcher dropdown on Characters button** | Off | When off, a separate Character Library icon is added to SillyTavern's top bar and the Characters button behaves normally. When on, the Characters button is hijacked: clicking it opens a small dropdown to choose between SillyTavern's native character manager and Character Library. |
+
+### Embedded Panel Settings
+
+These options apply when Embedded Panel mode is selected:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| **Launch on startup** | Off | Automatically open the embedded panel when SillyTavern loads. |
+| **Show SillyTavern top bar** | On | Keep SillyTavern's top navigation bar visible above the panel. When off, the panel takes the full viewport height. A "Back" button inside the panel returns you to your chat. |
+| **Exclusive panels** | On | When enabled, opening the embedded panel closes any open SillyTavern drawers, and opening an ST drawer closes the panel. Prevents panels from overlapping. |
+
+---
+
+## 🔧 Feature Details
+
+<details open>
+<summary><h3>🖼️ Media Management</h3></summary>
+
+- **Gallery tab** for all character images, video, and audio in one place
+- **Embedded media downloads** for images linked in creator notes, descriptions, and greetings
+- **External image-host extractors** for content embedded as gallery/album links (not direct image URLs). Supports Civitai, Imgchest, Mega, Pixiv, PostImg, Imgbox, ImgBB, Catbox, Dropbox, and Google Drive. The library walks each link, resolves the actual image URLs, and downloads them into the gallery folder. Pixiv and Dropbox require the [cl-helper plugin](#cl-helper-plugin-not-detected); the rest work without it
+- **Provider gallery downloads** from linked characters on ChubAI, Wyvern, or Pygmalion
+- **Audio & video support** including MP3, WAV, OGG, M4A with built-in player; video thumbnails with inline playback
+- **Full-screen viewer** with keyboard navigation (← → 0 Esc) and scroll-wheel zoom up to 5× with drag-to-pan
+- **Bulk localization** across your whole library from Settings, with progress tracking, abort, and history
+- **Optional provider gallery** inclusion in bulk localization
+- **Background media downloads** (opt-in): set **When an import has extra media** to **Download in the background** (**Settings → Media → Options**) and imports finish immediately while embedded media and gallery downloads run quietly, one character at a time, in a background queue. Track progress in the **notifications bell** in the topbar (**⋮ menu → Notifications** on mobile): live per-character progress, cancel, retry for failed jobs, and a clear-finished button. The queue survives page reloads and resumes automatically
+- **Grid card thumbnails** (opt-in) to cut decode cost and bandwidth on the characters grid. Enable in **Settings → Character Library → Grid Card Thumbnails**. By default thumbnails are served in the mobile layout only; toggle "Also use on desktop" to extend coverage. With the [cl-helper plugin](#cl-helper-plugin-not-detected) installed, cl-helper resizes via jimp and caches each thumbnail on disk at a configurable size (384 / 512 / 640 / 768px wide). Without cl-helper, ST's built-in `/thumbnail` endpoint is used (fixed 96x144, can look blurry on high-DPR screens). Two cache management buttons: **Populate at current size** pre-generates a thumbnail for every character (skipping already-cached) and **Purge cache** deletes every cached thumbnail. The detail modal and gallery always use the full-resolution image
+
+> **Civitai API key** (optional): Required only for private or hidden Civitai posts. Public content extracts without a key. Configure in **Settings → Online → Civitai API Key**. Generate one at [civitai.com/user/account](https://civitai.com/user/account). Using a key requires the [cl-helper plugin](#cl-helper-plugin-not-detected) (it attaches the key server-side); keyless public extraction works without it.
+
+> **Imgchest password-protected posts**: Card creators usually paste the password somewhere in the card text (creator's notes). The extractor scans these with a regex (matching common patterns like `password: ...`, `pw=...`, `pass is ...`) and submits it automatically. Authentication runs through the [cl-helper plugin](#cl-helper-plugin-not-detected); without cl-helper, only public posts are extractable.
+
+</details>
+
+<details>
+<summary><h3>✏️ Character Creator</h3></summary>
+
+Create new characters from scratch or edit existing ones with an AI-powered assistant built into the library.
+
+#### AI Studio
+
+Each card field (description, personality, scenario, first message, etc.) has a wand icon button that opens the **AI Studio** panel. Inside:
+
+- **Multi-turn conversation**: Chat with the LLM to iteratively refine the field. Ask for rewrites, adjustments, or entirely new content before applying
+- **Suggestion chips**: Quick-start prompts that appear per field (e.g. "Write a mysterious backstory", "Make them sarcastic and witty"). Click one to generate immediately
+- **Word target**: Set a target word count for generations using the number input. The LLM will aim to match it
+- **Undo / Redo**: History stack for the current studio session. Use the toolbar buttons or `Ctrl+Z` / `Ctrl+Y`. Opening a different field starts a fresh history
+- **Brainstorm mode**: Generate description text from scratch using only the character's existing metadata as context
+- **Apply to card**: When satisfied, click Apply to Card to write the generated text into the card field
+
+#### Highlight Revision
+
+Select (highlight) any portion of text in the AI Studio content area. The studio locks the selection, highlights it visually, and switches to **revision mode**: your next prompt targets only the highlighted section. The LLM rewrites just that segment and splices it back into the surrounding text automatically. Clear the selection to return to full-field mode.
+
+#### Custom System Prompts & Presets
+
+Each field has a **Settings** panel (gear icon) where you can:
+
+- **Override the system prompt**: Replace the built-in instruction for that field with your own
+- **Toggle context inclusion**: Choose which other card fields are sent as context when generating (e.g. exclude personality when generating a description)
+- **Save presets**: Save your custom prompt as a named preset, load it later, or delete it. Presets are saved per-field and persist across sessions
+
+A dot indicator appears on the gear icon when a field has active overrides.
+
+#### Connection Profiles
+
+If you have multiple Chat Completion sources configured in SillyTavern, a **Connection Profile** dropdown appears in the sidebar under AI Assist. This lets you use a different model for character creation than your chat model.
+
+#### Import from Library
+
+Click **Import from Library** to load an existing character's data into the creator form. This fully hydrates the character (fetching all card fields) and populates every form field including tags, avatar, alternate greetings, and lorebook. You can then modify and save as a new character or overwrite the original.
+
+#### Save Modes
+
+- **Create Character**: Saves as a brand-new character in your library
+- **Save as Existing**: When you imported from library, this option appears. Opens a stacked diff review (old on top, new below) showing exactly what changed before overwriting the original card. An automatic snapshot is saved before the overwrite so you can always undo
+
+#### Other Features
+
+- **Creator's Notes**: Live preview with zoom and resize controls, supporting rich HTML/CSS content
+- **Avatar**: Upload from file, or import from the library character's existing avatar
+- **Field expand/collapse**: Toggle all text fields between compact and expanded view
+- **AI tag suggestions**: Generate relevant tags from the character's existing card fields
+
+Access via the **⋮ menu** → **Create a Character**.
+</details>
+
+<details>
+<summary><h3>🎴 On-the-Fly Media Localization</h3></summary>
+
+Many character cards embed images from external hosts (Imgur, Catbox, etc.) which can be slow, unreliable, or go offline. Media Localization downloads these images locally and swaps the URLs **at display time only**. Your original character cards are never modified.
+
+1. Download embedded media via the **Gallery tab** → **"Download Embedded Media"**
+2. Enable **"Media Localization"** in Settings (globally or per-character)
+3. Remote URLs are transparently replaced with local copies in:
+   - Character Library detail views (creator notes, greetings, descriptions)
+   - **SillyTavern chat messages and Creator's Notes**, live in your conversations
+
+> **Note:** Some image hosts block direct downloads due to CORS restrictions. SillyTavern's built-in CORS proxy handles this automatically, but it must be enabled. See [Troubleshooting](#media-downloads-fail-with-cors-errors) if downloads fail.
+
+</details>
+
+<details>
+<summary><h3>♻️ Card Updates</h3></summary>
+
+Keep provider-linked characters in sync with their online source:
+
+1. Run **Check for Updates** (single character or batch)
+2. Review side-by-side diffs for each field
+3. Apply selected fields or apply all in batch
+
+Updates are fetched from the provider's API and only change the fields you choose. Works with all linked providers.
+
+> Review fields carefully before applying. If you manually tag your characters, skip the tags field during sync.
+
+</details>
+
+<details>
+<summary><h3>🕓 Version History & Snapshots</h3></summary>
+
+Track changes and restore previous versions of your character cards.
+
+#### Remote Versions (ChubAI)
+- View the full published version history from ChubAI's Git API
+- Field-by-field diff preview comparing any version to your local card
+- Restore any remote version with one click
+
+#### Local Snapshots (All Characters)
+- **Save snapshots** of any character's current state at any time
+- **Restore, rename, or delete** individual snapshots
+- **Auto-backup** before every restore, edit, or card update, with one-click undo
+- Auto-backups are deduped and capped at a configurable max (default 10) per character
+
+#### Diff Preview
+- Side-by-side comparison for every card field
+- **Tags** shown as pill badges with added/removed/kept highlighting
+- **Alternate greetings** displayed as numbered expandable blocks with change badges
+- **Long text fields** use LCS-based line diff with added/removed highlighting
+- Small diffs (≤8 lines) auto-expand for quick review
+- Avatar thumbnail with apply button to update the character's image
+
+#### Storage
+Snapshots are stored as JSON files via SillyTavern's Files API (`user/files/`), using a per-character file with a master index for fast lookups. Each character gets a stable `version_uid` that travels with the card PNG, so snapshots survive renames and reimports.
+
+</details>
+
+<details>
+<summary><h3>🔍 Duplicate Detection</h3></summary>
+
+- **Name similarity** and **creator matching** with fuzzy scoring
+- **Creator notes comparison** alongside name, creator, and content fields
+- **Jaccard similarity** for content comparison
+- **Content divergence penalty** to reduce false positives when name/creator match but card content clearly differs (e.g. male/female character variants)
+- **Duplicate media detection** via file hashing
+- **Match confidence & reasoning** for each result
+- **Exact mode**: Slide the sensitivity to maximum for strict duplicate detection, showing only pairs with identical content across all card fields
+- **Playlist integration**: In Exact mode, collect the newest or oldest card from each duplicate group into a playlist for batch cleanup
+- **Delete duplicates** directly from the interface with gallery transfer options
+- **Pre-import warnings** when downloading potential duplicates
+
+</details>
+
+<details>
+<summary><h3>🏷️ Display Name Override</h3></summary>
+
+Set a per-character display name that overrides the card's original name in the library grid and detail modal. The original name is always preserved in the card data.
+
+- **Per-character override**: Click the name type toggle in the character details header to switch between the card name and your custom display name
+- **SillyTavern integration**: Optionally push the display name into SillyTavern's chat and character panel (toggleable in Settings)
+- **Search and filter**: Find characters with overrides using the Advanced Filters panel
+- **Useful for**: Listing names from providers, translations, personal nicknames, or any scenario where you want a different display name without modifying the card
+
+</details>
+
+<details>
+<summary><h3>🔗 Related Character Discovery</h3></summary>
+
+Automatically finds similar characters via:
+- **Shared tags** with rarity weighting (rare tags = stronger signal)
+- **Same creator**
+- **Content keywords** (shared universes, franchises, themes)
+
+Shows relationship strength and reasoning for each suggestion.
+
+</details>
+
+<details>
+<summary><h3>🎲 Card Recommender</h3></summary>
+
+An AI-powered recommendation engine that uses your connected LLM to discover characters from your library based on natural-language prompts.
+
+#### How It Works
+
+1. **Describe what you want.** "Cozy fantasy girls," "dark horror villains," "sci-fi androids with deep lore," etc.
+2. Characters are **sampled from your library** and their metadata (name, tags, creator, creator notes, tagline) is sent to your LLM.
+3. The model evaluates each character against your prompt and returns a **ranked list with reasons.**
+4. Results appear as clickable cards with **expandable reasoning**.
+5. Use **Add all to playlist** to save the entire result set to a playlist in one click.
+6. **Reroll** to re-run the same prompt with the same settings. Previously picked characters are excluded so each reroll surfaces fresh suggestions from the remaining pool.
+
+#### Batch Mode
+
+For larger libraries, Batch Mode splits your sample pool across multiple parallel batches:
+
+1. **Map phase.** The pool is divided into N batches (configurable, 3-7) and all batches are evaluated simultaneously via parallel API calls.
+2. **Reduce phase.** All picks from every batch are collected, deduplicated, and sent to a final ranking pass that selects the best overall matches.
+3. Wall-clock time stays roughly the same as a single call thanks to parallelism, but library coverage scales with the batch count (e.g. 5 batches = 5x more characters evaluated).
+
+#### Sample Pool
+
+The Sample Pool controls which characters are eligible for recommendation. Apply pre-sampling filters to narrow the pool, and the "characters in pool" count updates in real time as you adjust them:
+
+- **Has Chats** / **Favorite** tri-state filters (Yes / Any / No)
+- **Date Created** range
+- **Include / Exclude tags** with autocomplete
+
+If the pool is larger than your configured Sample Size, characters are randomly selected from the filtered pool to fit. For example, with 2,000 characters matching your filters and a sample size of 600, a random subset of 600 is drawn each time you generate.
+
+#### LLM Context
+
+Controls which card metadata fields are included when sending characters to the LLM. Toggle any combination of: tags, creator notes, tagline, creator name, source provider, and description (opt-in, off by default). A live token estimate updates as you change these, helping you stay within model context limits.
+
+#### API Modes
+
+- **SillyTavern mode** uses your active Chat Completion connection (OpenAI, Claude, OpenRouter, etc.). If you have Connection Profiles configured, a dropdown lets you pick which profile to use. Large, RP heavy presets not recommended.
+- **Custom API mode** lets you point to any OpenAI-compatible endpoint with optional API key and model.
+
+#### Settings
+
+| Setting | Description |
+|---------|-------------|
+| Sample Size | Characters per batch (10-500) |
+| Batches | Parallel batch count in Batch Mode (3-7) |
+| Temperature | LLM sampling temperature (Custom API only, ST mode uses your preset) |
+| Max Results | Maximum recommendations to return |
+| LLM Context | Toggle which metadata fields to include (tags, creator notes, tagline, creator, source, opt-in description) with live token estimate |
+
+Access via the **⋮ menu** → **Card Recommender**.
+
+> **Requirements:** Chat Completion APIs only (not Text Completion). The model must be capable of returning structured JSON, so budget/nano models may produce unparseable results. Models like GPT-4o-mini, Claude Haiku, Gemini Flash, or equivalent work well.
+
+> **Non-deterministic.** LLMs are inherently probabilistic, so running the same prompt twice may yield different recommendations.
+
+> **Token usage.** Each generation sends your sample pool's metadata to the model. The live token estimate in Settings helps you gauge cost before generating, but it is a rough approximation based on loose averages, not an actual token count. Enabling more context fields (creator notes, tagline) increases token usage per character. In Batch Mode, tokens scale linearly with the batch count, plus a smaller reduce pass.
+
+</details>
+
+<details>
+<summary><h3>💬 Chat History Browser</h3></summary>
+
+- **Browse all conversations** across all characters
+- **Sort by** date, character name, message count, chat length, or most active character
+- **Group by character** or view flat list
+- **Card density presets** (Spacious / Comfortable / Compact / Minimal) to control how much detail each chat card shows
+- **AI model badges** showing which model was used for each conversation
+- **Message previews** before opening
+- **Jump into any chat** without returning to SillyTavern
+
+</details>
+
+<details>
+<summary><h3>📦 Bundle Export / Import</h3></summary>
+
+Move characters between SillyTavern instances with everything attached, not just the card PNG.
+
+- **Export** via multi-select: pick characters, hit Export, and choose between three modes: a **full bundle** (.zip with cards, all chats, and gallery folders), **character cards** (each card as a separate PNG), or **provider links** (copy the source URLs of linked characters to the clipboard)
+- **Include linked lorebooks** toggle adds each character's linked world files to the full bundle
+- **Import** by dragging the bundle .zip into the import dialog on the target instance. Cards, chats, gallery folders, and lorebooks are restored, along with metadata that a plain PNG import loses (favorite status, creation date, active chat)
+- A progress log reports exactly what was exported or restored, with per-item warnings on failures
+
+</details>
+
+<details>
+<summary><h3>📖 Lorebook Manager</h3></summary>
+
+A full manager for SillyTavern world files, opened from **More Options (⋮) → Lorebooks**.
+
+- **Browse all lorebooks** with entry counts and a "used by" view showing which characters link each file (primary links) and which chats have it chat-bound
+- **Create, import (.json), duplicate, export, and delete** world files
+- **Edit entries** inline: keywords, content, insertion settings, per-entry enable/disable
+- **AI entry generation**: describe what you want and let the LLM draft lorebook entries
+- **Link lorebooks to characters** from the manager or from the character detail modal's Linked Lorebook box, with a playlist filter for bulk linking. This covers the character's primary lorebook; *additional* lorebooks (ST's charLore) are not manageable from here, as they live in SillyTavern's settings with no clean external access
+- **Bind lorebooks to chats** (chat lore) from the manager or directly from a chat card in the Chats view; group chats are read-only
+
+</details>
+
+<details>
+<summary><h3>🎨 Custom CSS & AI Assistant</h3></summary>
+
+Theme or tweak the UI with your own CSS, managed as snippets. Open from **Settings → Theme & Layout → Open Custom CSS Editor**.
+
+- **Snippets** can be individually enabled, disabled, renamed, reordered, and deleted; styles persist across reloads
+- **AI CSS Assistant**: every snippet row has a wand button that opens a chat-style assistant. Describe the look you want ("dim the card grid", "make the accent purple") and it writes the CSS; iterate with follow-ups and save the result as a new snippet or update the one you started from
+- The assistant knows the app's component classes and theme tokens, so its snippets target the real UI instead of guessing selectors
+- Class names may change between versions, so treat custom CSS as power-user territory
+
+</details>
+
+<details>
+<summary><h3>🗂️ Unique Gallery Folders</h3></summary>
+
+> ⚠️ **Experimental Feature.** Enable in Settings, Gallery Folders.
+
+#### The Problem
+SillyTavern stores gallery images in folders named after the character (e.g., `/user/images/Nami/`). Multiple characters with the same name share the same folder, mixing all their images together.
+
+#### The Solution
+Each character gets a **unique gallery folder** using a 12-character ID:
+```
+/user/images/Nami_aB3xY9kLmN2p/
+/user/images/Nami_7Fk2mPqR4sXw/
+```
+
+A `gallery_id` is stored in the character's `data.extensions` and SillyTavern's gallery extension is configured to use the unique folder.
+
+#### Migration Tools
+- **Assign Gallery IDs** to characters that don't have one
+- **Migrate All Images** from old folders to new unique folders (uses content hashing for shared-name disambiguation)
+- **Browse Orphaned Folders** to find and redistribute images from legacy folders
+
+#### Disabling
+When disabled, you can choose to move images back to default folders, keep them in place, or cancel.
+
+> Gallery IDs in character data are preserved when disabled, so re-enabling uses the same IDs.
+
+<details>
+<summary>⚠️ Why Experimental?</summary>
+
+- **Changes ST's default behavior** by overriding how SillyTavern resolves gallery folders
+- **Modifies character data** by adding `gallery_id` to character extensions
+- **Migration complexity** for large libraries with many same-name characters
+- The character card ecosystem has barely enforced standards, so media URLs, CDN behaviors, and creator practices vary wildly
+
+**Back up your ST user folder before enabling this feature.**
+
+</details>
+
+</details>
+
+<details>
+<summary><h3>✅ Gallery Integrity & Sync</h3></summary>
+
+When **Unique Gallery Folders** is enabled, each character's gallery depends on a `gallery_id` stored in the card and a matching folder override registered with SillyTavern. If either gets out of sync (e.g., importing a card directly through SillyTavern, or after a backup restore), images can end up in the wrong folder or become invisible.
+
+- **Status indicator** in the topbar **notifications bell** (shared with background media downloads): the bell switches to a warning icon with a count when characters are missing a `gallery_id`
+- **Integrity checks** for missing `gallery_id`s, orphaned mappings, and unregistered overrides
+- **Cleanup tools** to assign or remove orphaned mappings safely
+- **ST import warning + 1-click fix** when a card is added directly in SillyTavern
+
+</details>
+
+---
+
+## 🌐 Online Providers
+
+The **Online** tab lets you browse, search, and import characters from multiple online sources. Switch between providers using the provider selector dropdown.
+
+All providers share a common set of capabilities:
+- **Browse & search** with filtering and sorting
+- **Infinite scroll** with automatic page loading as you scroll (toggleable per provider)
+- **In-app character preview** with full card details, gallery images, and stats
+- **One-click import** to your local library
+- **"In Library" badges** on characters you already own
+- **"Hide Owned" filter** to only show characters not in your library
+- **NSFW toggle** to show or hide NSFW content
+- **Character linking** to link local characters to their online source for updates
+- **Bulk link scanner** to automatically scan your library and match unlinked characters
+- **Auto-link on import** for characters imported from any provider
+- **Per-provider browse defaults** in Settings → Online: pick the default view mode, sort order, and Hide Owned / Hide Possible states each provider starts with
+
+Providers with Following support include a **Followed Creators Manager** panel for browsing, searching, adding, and removing followed creators directly from the Following tab.
+
+### Provider Feature Matrix
+
+| Feature | ChubAI | JanitorAI | CharacterTavern | Pygmalion | Wyvern | DataCat | Botbooru |
+|---------|--------|-----------|-----------------|-----------|--------|----------|----------|
+| Browse & Search | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Card Updates | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Character Linking | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Gallery Downloads | ✅ | -- | -- | ✅ | ✅ | ✅ | ✅ |
+| Remote Version History | ✅ | -- | -- | -- | -- | -- | -- |
+| Following / Timeline | ✅ | -- | -- | ✅ | ✅ | ✅ | ✅ |
+| Favorites | ✅ | -- | -- | -- | -- | -- | ✅ |
+| Auth Required | Optional | None | Optional | Optional | Optional | None | Optional (NSFW needs login) |
+
+<details>
+<summary><h3>ChubAI</h3></summary>
+
+**Auth:** Optional URQL token (from browser DevTools → Local Storage → `URQL_TOKEN`)
+
+#### Without Authentication
+- Browse and search public characters
+- Full filtering by tags, token count, content features
+- Discovery presets: Popular (week/month/all), Top Rated, Newest, Recently Updated, Random, and more
+- In-app character preview with metadata and download stats
+
+#### With URQL Token
+- **Timeline** with new releases from followed authors
+- **Favorites filtering** to show only your saved favorites
+- **Toggle favorites** to add/remove from your ChubAI favorites list
+- **Follow/Unfollow authors** to track creators you like
+- **Restricted content** access
+
+#### ChubAI-Specific Features
+- **Gallery downloads** from linked characters
+- **Remote version history** showing the full Git commit history of any linked character
+- **V4 Git API** (optional setting) for fetching card data directly from ChubAI's Git repository
+- **Linked lorebook resolution** for lorebooks linked to a character (not just embedded ones)
+
+#### Getting Your Token
+1. Log into [chub.ai](https://chub.ai)
+2. Open DevTools (F12) → **Application** tab → **Local Storage** → `https://chub.ai`
+3. Copy the `URQL_TOKEN` value
+4. Paste in Character Library Settings
+
+</details>
+
+<details>
+<summary><h3>JanitorAI</h3></summary>
+
+**Auth:** None required. Uses a public API key automatically.
+
+- Browse and search the full JanitorAI character catalog
+- Filter by tags, token count, NSFW toggle
+- In-app character preview with card details
+- Character linking and card updates
+
+No gallery downloads or version history (JanitorAI doesn't expose these APIs).
+
+</details>
+
+<details>
+<summary><h3>CharacterTavern</h3></summary>
+
+**Auth:** Optional session cookie (for NSFW access). Requires the [cl-helper plugin](#cl-helper-plugin-not-detected).
+
+- Browse and search the CharacterTavern catalog
+- Filter by tags, token count, has-lorebook, is-OC (original character)
+- In-app character preview with card details
+- Character linking and card updates
+
+#### NSFW Access
+CharacterTavern requires a session cookie for NSFW content. To set it up:
+1. Ensure the [cl-helper plugin](#cl-helper-plugin-not-detected) is installed and detected
+2. Log into [character-tavern.com](https://character-tavern.com) in your browser
+3. Open DevTools (F12) → **Application** tab → **Cookies** → `character-tavern.com`
+4. Copy the `session` cookie value
+5. Paste it in the login modal (appears when you enable NSFW) or in Settings
+
+</details>
+
+<details>
+<summary><h3>Pygmalion</h3></summary>
+
+**Auth:** Optional email/password login. Requires the [cl-helper plugin](#cl-helper-plugin-not-detected).
+
+- Browse and search the Pygmalion character catalog
+- Filter by tags, NSFW toggle
+- Sort by downloads, stars, views, chat count, or newest
+- In-app character preview with card details
+- Character linking and card updates
+
+#### With Authentication
+- **Following timeline** with characters from users you follow
+- **Follow/Unfollow users** from within the app
+- **Gallery downloads** including alt avatars, alt images, and chat backgrounds
+- **"Remember credentials"** for automatic token refresh
+
+#### Login
+1. Ensure the [cl-helper plugin](#cl-helper-plugin-not-detected) is installed and detected
+2. When you enable NSFW or access a login-required feature, a login modal will appear
+3. Enter your Pygmalion email and password (or set them in Settings)
+4. *(Optional)* Check "Remember credentials" for auto-refresh
+
+</details>
+
+<details>
+<summary><h3>Wyvern</h3></summary>
+
+**Auth:** Optional email/password login (Firebase). No plugin required.
+
+- Browse and search the Wyvern character catalog
+- Discovery-focused sorting: popularity, recommended, newest, most likes, and most messages
+- Filter by tags and NSFW state
+- In-app character preview before import
+- Gallery downloads from linked Wyvern characters
+
+#### With Authentication
+- **Following timeline** from creators you follow
+- **Follow/Unfollow users** directly from the preview modal
+
+#### Character Library Integration
+- **Link local cards to Wyvern** for update checks and sync
+- **Auto-link on import** when importing directly from Wyvern
+
+#### Login
+1. When you enable NSFW or access a login-required feature, a login modal will appear
+2. Enter your Wyvern email and password (or set them in Settings)
+3. *(Optional)* Check "Remember credentials" for auto-refresh
+
+</details>
+
+<details>
+<summary><h3>DataCat (Experimental)</h3></summary>
+
+**Auth:** None required. An anonymous session is created automatically via the [cl-helper plugin](#cl-helper-plugin-not-detected).
+
+> **This provider is experimental and disabled by default.** Enable it in Settings > Online > Providers. Expect rough edges: the API is barebones and some features may return incomplete results.
+
+DataCat aggregates JanitorAI characters with its own REST API and AI-powered character scoring.
+
+- Browse recent and popular characters
+- Sort by newest, trending, popular, and Hampter algorithm modes
+- Hampter sort orders (Latest, Trending, Trending 24h, Popular, Relevance) sit behind Cloudflare bot protection. A direct browser load is hit-or-miss (Cloudflare usually blocks it), so the companion **userscript** (`extras/cl-janitor-bridge.user.js`, installed in Tampermonkey or Violentmonkey) is the reliable path; it makes the Cloudflare-gated request from your own browser. JanitorAI serves only the first page of these sorts anonymously; paste your JanitorAI `sb-auth-auth-token` cookie under Settings > Online > DataCat to page further (the session then refreshes itself). Other DataCat and MeiliSearch sort orders need neither
+- Filter by tags and NSFW toggle
+- In-app character preview with card details
+- Character linking and card updates
+- **Creator search** to find characters by a specific creator
+- **JanitorAI search** via MeiliSearch integration (searches JanitorAI's full catalog through DataCat)
+- **Following tab** to browse characters from creators you follow
+- **Inline extraction** in the preview modal when viewing a JanitorAI character not yet on DataCat
+- **Re-extraction for updates** to ensure the latest character definition is compared during update checks
+
+#### JanitorAI Extraction
+
+DataCat can extract character definitions from JanitorAI URLs, including private/hidden definitions that aren't available via JanitorAI's public API:
+
+1. Paste a JanitorAI character URL in the DataCat search bar
+2. If the character is already on DataCat, the preview opens directly
+3. If not, an extraction panel appears. Click **Extract** to queue the request
+4. DataCat runs a cloud browser instance to retrieve the character definition
+5. Once complete, the character is available for preview and import
+
+Extraction is handled entirely by DataCat's servers. The `appearOnPublicFeed` option in Settings controls whether extracted characters appear on DataCat's public feed.
+
+#### Setup
+1. Ensure the [cl-helper plugin](#cl-helper-plugin-not-detected) is installed and detected (required for session proxying)
+2. Enable DataCat in Settings > Online > Providers
+3. The session initializes automatically on first browse
+4. (Optional, for the JanitorAI Hampter sorts) Install the companion userscript `extras/cl-janitor-bridge.user.js` in a userscript manager like Tampermonkey or Violentmonkey, and add your JanitorAI login in Settings > Online > DataCat to page past the first page
+
+</details>
+
+<details>
+<summary><h3>Botbooru</h3></summary>
+
+**Auth:** Optional username/password login. The login handshake goes through the [cl-helper plugin](#cl-helper-plugin-not-detected); without the plugin you can paste an API token manually instead. Anonymous browsing is **SFW-only**: the server filters NSFW regardless of client settings.
+
+- Browse and search the Botbooru card catalog (tag-driven: include tags, exclude with `-tag`)
+- Sort by latest, curated, or random, plus a full popularity matrix: most favorited, most viewed, and most downloaded, each over day, week, month, or all time
+- **Curated extras**: a **New uploads only** toggle excludes bumped/updated cards from the Curated feed; weighted-tag accounts also pick between Recent, Tag Score, and Only Followed orderings
+- **Advanced Options** (Tags dropdown): a **Min Tokens** threshold with an optional **Count lorebook tokens** switch, plus an uploaded after/before date range
+- **Hide AI-generated** content filter (Features dropdown)
+- In-app character preview with card details and tag list
+- Imports the full V2 card (PNG with embedded data, JSON also available)
+- Character linking and card updates
+- Gallery downloads from linked Botbooru posts
+- **Writer credit on cards**: the Writer tag is shown as the creator; the uploader has its own entry point to browse everything they've posted
+
+#### With Authentication
+- **NSFW browsing** - Character Library syncs your account's NSFW visibility switches automatically the first time you enable the NSFW toggle (a separate NSFL checkbox is available; NSFL cards carry their own badge, distinct from NSFW)
+- **Following timeline** built from uploaders you follow (follow by profile URL or numeric user id), with its own sort options (newest, oldest, name, favorites, views, downloads, random); uploader banners reflect your account's live follow state
+- **Post favorites** (heart) synced with your account
+- **Favorite tags** - starred tags act as boosters for the Curated sort and are stored on your account, manageable from Settings > Online > Botbooru (the tag inputs autocomplete from Botbooru's tag list; a `category:` prefix like `char:` narrows matches)
+- **Weighted tag mode (experimental)** - account-side switch in Settings > Online > Botbooru that replaces the simple favorite-tags list with per-tag weights (-1000 to 1000) plus always-follow / always-block flags, and unlocks the extra Curated orderings. While it's on, the site ignores the simple list (Character Library disables it with a warning) and the browse Tags-dropdown stars manage weight entries (+100) instead
+- Your account's tag blacklist applies server-side to browse results
+
+#### Login
+1. When you enable NSFW or use a login-required feature, the login modal appears (also reachable from the filter bar's account button)
+2. Enter your Botbooru username and password (requires the [cl-helper plugin](#cl-helper-plugin-not-detected))
+3. Without the plugin, paste a token manually in the same modal; tokens are long-lived (~90 days) and a copied `Bearer ` prefix is stripped automatically
+
+</details>
+
+### Character Linking
+
+Link your local characters to their online source for updates, gallery downloads, and version history:
+
+- **Manual linking** via the provider indicator in character details
+- **Bulk link scanner** to auto-match unlinked characters (accessible from the ⋮ menu)
+- **Auto-link on import** for characters downloaded from any provider
+- **View on provider** to jump to the source site or open an in-app preview
+
+### Batch Import
+
+- Paste multiple URLs from any supported provider (one per line)
+- **Direct URL downloads**: check **Import unrecognized URLs as direct downloads** (URL mode) to fetch links that don't match any provider as plain PNG cards. Catbox, Discord CDN, and raw GitHub links work out of the box; allow other hosts via `whitelistImportDomains` in SillyTavern's `config.yaml`. Downloaded cards ride the normal import pipeline: duplicate check, provider auto-link, and the auto-download options
+- Drag & drop or browse local PNG character card files
+- Progress tracking and error logging
+- Pre-import duplicate detection
+- **Auto-download options** to download gallery and embedded media during import
+
+---
+
+## 🔎 Search Filters
+
+Type these prefixes in the search bar for targeted filtering:
+
+| Filter | Example | Description |
+|--------|---------|-------------|
+| `creator:` | `creator:AuthorName` | Creator/author contains match (case-insensitive) |
+| `fav:` | `fav:yes` or `fav:no` | Filter by favorites status (also `favorite:`) |
+| `linked:` | `linked:yes` or `linked:no` | Any provider link |
+| `chub:` | `chub:yes` or `chub:no` | ChubAI link specifically |
+| `janny:` | `janny:yes` or `janny:no` | JanitorAI link specifically |
+| `ct:` | `ct:yes` or `ct:no` | CharacterTavern link specifically (also `charactertavern:`) |
+| `pygmalion:` | `pygmalion:yes` or `pygmalion:no` | Pygmalion link specifically |
+| `wyvern:` | `wyvern:yes` or `wyvern:no` | Wyvern link specifically |
+| `datacat:` | `datacat:yes` or `datacat:no` | DataCat link specifically (also `dc:`) |
+| `botbooru:` | `botbooru:yes` or `botbooru:no` | Botbooru link specifically (also `bb:`) |
+| `version:` | `version:1.0` or `version:none` | Match character version string (or `none` for unversioned) |
+| `gallery:` | `gallery:aB3x` or `gallery:none` | Match gallery ID (or `none` for unassigned) |
+| `uid:` | `uid:abc123` or `uid:none` | Match version UID (or `none` for unassigned) |
+| `playlist:` | `playlist:backlog` or `playlist:none` | Match playlist name (or `none`/`any` for membership) |
+
+Regular search matches across name, tags, author, and creator's notes (toggleable via checkboxes).
+
+Prefixes can be combined with each other and with free text. For example, `creator:john linked:yes dark elf` finds linked characters by "john" matching "dark elf" in the enabled search fields.
+
+---
+
+## ⌨️ Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| `Escape` | Close modals, overlays, exit multi-select mode |
+| `Space` | Toggle multi-select mode (when not in a text field) |
+| `Enter` | Add tag (when tag input is focused) |
+| `Arrow Down` | Focus first tag suggestion |
+| `← / →` | Navigate images in gallery viewer |
+| `0` | Reset zoom in gallery viewer |
+| `Scroll wheel` | Zoom in/out in gallery viewer |
+
+---
+
+## 📱 Mobile
+
+The full app is optimized for mobile with:
+
+- **Touch-optimized** tap targets and swipe gestures throughout
+- **View swipe**: swipe left/right on the main screen to switch between Characters, Chats, and Online views
+- **Tab swipe**: swipe left/right on character detail tabs to navigate between them
+- **Greetings swipe**: swipe left/right to cycle alternate greetings
+- **Card swipe gestures**: swipe right on a card to toggle favorite, swipe left to open the context menu. Card swipes are suppressed in the outer 12% of each card and the bottom 25%, so view-swipe and tab-swipe gestures starting near card edges aren't hijacked. Toggle the whole feature in Settings if you find swipes triggering accidentally
+- **Prev/Next character navigation**: swipe left/right on the character detail modal header to step through the current sort + filter view (toggleable in Settings)
+- **Mobile search overlay**: bottom-pinned and keyboard-aware. The search box opens above the bottom nav when the keyboard is closed, and lifts above the keyboard when it opens, so the whole flow stays in the thumb zone
+- **Title scroll-reveal**: tap a long character name in the modal header, or a long chat title in the chat preview header, to scroll through the full text
+- **Bottom sheets** for context menus, tag editor, filters, settings, and confirm dialogs (replacing desktop dropdowns)
+- **Full-viewport modals** for character details and previews
+- **Top-bias face crop** on avatar thumbs across chat list rows, group composites, message bubbles, and the mobile detail-modal header thumb, so faces survive the circular and square crops
+- **Gallery viewer** with pinch / scroll-wheel zoom, drag pan, and swipe navigation
+- **Haptic feedback** on swipe actions, toggles, and destructive confirms (requires device support)
+- **Back button handling** for modal navigation: Android back closes the top overlay in tier order before exiting the app
+
+---
+
+## ❓ Troubleshooting
+
+### cl-helper plugin not detected
+
+The **cl-helper** plugin is required for Pygmalion login, Botbooru login, CharacterTavern NSFW access, DataCat session proxying, the Pixiv and Dropbox gallery extractors, Imgchest password-protected posts, Civitai API-key requests, and the disk-cached avatar/gallery thumbnails. It ships with Character Library in the `extras/cl-helper/` folder but needs to be placed in SillyTavern's plugins directory:
+
+1. Copy (or symlink) the `extras/cl-helper` folder into your SillyTavern **plugins** directory:
+   ```
+   SillyTavern/plugins/cl-helper/
+   ```
+2. Open your SillyTavern **config.yaml** (in your ST root folder) and set `enableServerPlugins` to `true`:
+   ```yaml
+   enableServerPlugins: true
+   ```
+3. **Restart SillyTavern** (plugins only load at startup)
+4. Verify in the login/auth modal (appears when enabling NSFW). You should see "cl-helper plugin detected"
+
+> The plugin runs server-side to handle auth flows that browsers can't do directly (e.g. Origin headers for Pygmalion, cookie proxying for CharacterTavern, session token management for DataCat). It only communicates with the specific provider APIs through hostname-pinned, path-allowlisted proxies; most are read-only GET proxies, plus a handful of dedicated POST routes for login handshakes and extraction. See the [plugin source](extras/cl-helper/index.js) for details.
+
+### Media downloads fail with CORS errors
+
+Some image hosts (Imgur, Catbox, etc.) block direct browser requests due to CORS restrictions. Character Library automatically falls back to SillyTavern's built-in CORS proxy, but it must be enabled. This is a server-side setting; there is no toggle for it in SillyTavern's UI:
+
+1. Open `config.yaml` in your SillyTavern root folder
+2. Set `enableCorsProxy: true`
+3. Restart the SillyTavern server
+4. Retry the download in Character Library
+
+This affects embedded media downloads, provider gallery downloads, and bulk localization.
+
+### JanitorAI Hampter sorts say "Cloudflare blocked this request"
+
+JanitorAI's Hampter sort orders (Latest, Trending, and the rest, on the DataCat provider) sit behind Cloudflare bot protection. A direct load usually gets blocked (it occasionally slips through, but you can't rely on it). Install the companion userscript for dependable access:
+
+1. Install a userscript manager (Tampermonkey or Violentmonkey)
+2. Add `extras/cl-janitor-bridge.user.js` from this repository
+3. Reload the Character Library tab and retry the sort
+
+The userscript makes the Cloudflare-gated request from your own browser and hands only the results to Character Library. Without it these sorts are unreliable (Cloudflare usually blocks the direct fetch, though it occasionally gets through); every other DataCat and JanitorAI sort order works without it. To page past the first page, also add your JanitorAI login under Settings > Online > DataCat. Tested on desktop; on mobile, a userscript-capable browser such as Firefox for Android, or a mobile-specific solution that routes the request through a webview, works too.
+
+### Characters load more slowly behind HTTP Basic auth
+
+If SillyTavern is behind HTTP Basic authentication (ST's `basicAuthMode`, or an upstream reverse proxy that asks for a username and password), loading a character's heavy data can be noticeably slower than on an instance without it.
+
+To keep memory low on large libraries, Character Library holds only lightweight data in memory and fetches each character's full content (description, greetings, embedded lorebook, etc.) on demand, one request per character. Basic auth adds overhead to each request, so it is paid on every per-character load: the detail view opens instantly but its text fills in a moment later, and update or version checks run slower. The character grid loads in one bulk request and is unaffected. This happens regardless of ST's `lazyLoadCharacters` setting (it comes from Character Library's own memory optimization, not ST shallow loading); enabling ST lazy loading only makes it more noticeable.
+
+The delay is in how Basic auth is handled per request between your browser and SillyTavern, not processing time in either, so there is no extension setting to speed it up. If it is bothersome, reach SillyTavern over a trusted local network or a tunnel/VPN that authenticates the connection rather than each HTTP request.
+
+---
+
+### Reminder: Online features depend on services we don't control
+
+Anything in Character Library that reaches an external service rides on third-party APIs we neither own nor control: the online provider browsers (ChubAI, JanitorAI, CharacterTavern, Pygmalion, Wyvern, DataCat, Botbooru) and their imports, plus embedded media and gallery downloads. Those services change without warning. Endpoints get renamed or removed, response shapes shift, access is tightened, rate limits change, and Cloudflare-style protections start challenging automated requests. When one of them changes, the feature that relied on it can break or start misbehaving, and there is frequently nothing the extension can do from its side until the new behavior is understood.
+
+We treat these as bugs and fix them as they come, but this kind of breakage is inevitable over time and largely outside our hands. The fastest path to a fix is a report. If a provider stops working or starts acting strangely, please open an issue describing what you did and what happened.
+
+## License
+
+Licensed under the [GNU Affero General Public License v3](LICENSE).

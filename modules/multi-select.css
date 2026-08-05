@@ -1,0 +1,257 @@
+/* =========================================================
+   Multi-Select Module Styles
+   ========================================================= */
+
+/* Multi-select mode indicator */
+body.multi-select-mode .char-card {
+    cursor: pointer;
+    position: relative;
+}
+
+/* always in dom (display:none), revealed in multi-select mode; real div + i for themer control */
+.char-card-checkbox {
+    display: none;
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    width: 24px;
+    height: 24px;
+    border: 2px solid rgba(255, 255, 255, 0.5);
+    border-radius: var(--radius-sm);
+    background: rgba(0, 0, 0, 0.3);
+    align-items: center;
+    justify-content: center;
+    color: white;
+    font-size: var(--font-md-lg);
+    z-index: 10;
+    transition: all 0.2s;
+}
+
+.char-card-checkbox i {
+    opacity: 0;
+    transition: opacity 0.15s;
+}
+
+body.multi-select-mode .char-card-checkbox {
+    display: flex;
+}
+
+body.multi-select-mode .char-card.selected .char-card-checkbox {
+    background: var(--accent);
+    border-color: var(--accent);
+}
+
+body.multi-select-mode .char-card.selected .char-card-checkbox i {
+    opacity: 1;
+}
+
+body.multi-select-mode .char-card:hover .char-card-checkbox {
+    border-color: var(--accent);
+}
+
+/* Multi-select toolbar */
+.multi-select-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 16px;
+    background: linear-gradient(135deg, rgba(26, 26, 46, 0.95) 0%, rgba(30, 30, 50, 0.95) 100%);
+    border-bottom: 1px solid rgba(var(--accent-rgb), 0.2);
+    gap: var(--space-lg);
+    backdrop-filter: blur(10px);
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3);
+    flex-wrap: nowrap;
+    overflow-x: auto;
+}
+
+.multi-select-toolbar.hidden {
+    display: none;
+}
+
+.multi-select-left {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm-md);
+}
+
+.multi-select-badge {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-secondary) 100%);
+    padding: 6px 12px;
+    border-radius: var(--radius-4xl);
+    font-weight: 600;
+    font-size: var(--font-base);
+    color: var(--accent-text);
+    box-shadow: 0 2px 8px var(--accent-glow);
+}
+
+.multi-select-badge i {
+    font-size: var(--font-md);
+    opacity: 0.9;
+}
+
+.multi-select-label {
+    color: var(--SmartThemeBodyColor, #aaa);
+    font-size: var(--font-md);
+}
+
+.multi-select-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-xs-sm);
+    flex: 1;
+    justify-content: center;
+    flex-wrap: nowrap;
+}
+
+.multi-select-right {
+    display: flex;
+    align-items: center;
+    gap: var(--space-xs-sm);
+}
+
+.ms-divider {
+    width: 1px;
+    height: 24px;
+    background: rgba(255, 255, 255, 0.15);
+    margin: 0 6px;
+}
+
+.ms-btn {
+    display: flex;
+    align-items: center;
+    gap: var(--space-xs-sm);
+    padding: 8px 14px;
+    border-radius: var(--radius-lg);
+    border: 1px solid transparent;
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--SmartThemeBodyColor, #eee);
+    cursor: pointer;
+    font-size: var(--font-md);
+    font-weight: 500;
+    transition: all 0.2s ease;
+    white-space: nowrap;
+}
+
+.ms-btn:hover {
+    background: rgba(255, 255, 255, 0.15);
+    border-color: rgba(255, 255, 255, 0.1);
+    transform: translateY(-1px);
+}
+
+.ms-btn:active {
+    transform: translateY(0);
+}
+
+.ms-btn i {
+    font-size: var(--font-base);
+}
+
+.ms-btn-ghost {
+    background: transparent;
+}
+
+.ms-btn-ghost:hover {
+    background: rgba(255, 255, 255, 0.08);
+}
+
+.ms-btn-danger {
+    background: rgba(239, 68, 68, 0.15);
+    color: #f87171;
+    border-color: rgba(239, 68, 68, 0.2);
+}
+
+.ms-btn-danger:hover {
+    background: rgba(239, 68, 68, 0.25);
+    border-color: rgba(239, 68, 68, 0.4);
+}
+
+.ms-btn-exit {
+    background: rgba(100, 100, 120, 0.3);
+    padding: 8px 10px;
+}
+
+.ms-btn-exit:hover {
+    background: rgba(100, 100, 120, 0.5);
+}
+
+/* Toggle button active state */
+#multiSelectToggleBtn.active {
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-secondary) 100%);
+    color: var(--accent-text);
+    box-shadow: 0 2px 8px var(--accent-glow);
+}
+
+/* =========================================================
+   Mobile-mode overrides (html.cl-mobile)
+   ========================================================= */
+html.cl-mobile .ms-btn {
+    touch-action: manipulation;
+}
+
+html.cl-mobile .multi-select-toolbar {
+    flex-wrap: nowrap;
+    padding: var(--space-xs) var(--space-sm);
+    gap: var(--space-xs);
+    flex-shrink: 0;
+    overflow-x: auto;
+    backdrop-filter: none !important;
+    transition: none !important;
+}
+html.cl-mobile .multi-select-toolbar.hidden {
+    display: none !important;
+}
+
+/* Kill per-card checkbox transition */
+html.cl-mobile body.multi-select-mode .char-card .char-card-checkbox {
+    transition: none !important;
+}
+html.cl-mobile body.multi-select-mode .char-card .char-card-checkbox i {
+    transition: none !important;
+}
+html.cl-mobile .multi-select-left {
+    gap: var(--space-xs);
+    flex-shrink: 0;
+}
+html.cl-mobile .multi-select-badge {
+    padding: var(--space-2xs) var(--space-sm);
+    font-size: var(--font-sm);
+    gap: var(--space-xs);
+}
+html.cl-mobile .multi-select-label {
+    display: none;
+}
+html.cl-mobile .multi-select-actions {
+    display: flex;
+    flex-wrap: nowrap;
+    gap: var(--space-xs);
+    justify-content: center;
+    min-width: 0;
+}
+html.cl-mobile .ms-btn {
+    padding: 0;
+    gap: 0;
+    min-width: 32px;
+    min-height: 32px;
+    width: 32px;
+    height: 32px;
+    flex-shrink: 0;
+    justify-content: center;
+}
+html.cl-mobile .ms-btn i {
+    font-size: var(--font-base);
+}
+html.cl-mobile .ms-btn span {
+    display: none;
+}
+html.cl-mobile .ms-divider {
+    display: none;
+}
+html.cl-mobile .multi-select-right {
+    gap: var(--space-xs);
+}
+html.cl-mobile .ms-btn-exit {
+    padding: 0;
+}
